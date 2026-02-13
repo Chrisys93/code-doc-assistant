@@ -1,0 +1,22 @@
+# RAG Framework
+llama-index-core>=0.11.0
+llama-index-llms-ollama>=0.3.0
+llama-index-embeddings-ollama>=0.3.0
+llama-index-vector-stores-chroma>=0.2.0
+llama-index-readers-file>=0.2.0
+
+# Vector DB
+chromadb==0.6.3
+
+# Code parsing (AST-aware chunking)
+tree-sitter>=0.21.0
+tree-sitter-language-pack>=0.1.0
+llama-index-readers-github>=0.2.0
+
+# UI
+streamlit>=1.37.0
+
+# Utilities
+python-dotenv>=1.0.0
+gitpython>=3.1.0
+requests>=2.31.0

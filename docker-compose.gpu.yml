@@ -1,0 +1,19 @@
+# ============================================================
+# Docker Compose Override — GPU Acceleration (NVIDIA)
+# ============================================================
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+#
+# Requires: NVIDIA GPU + drivers + nvidia-container-toolkit
+# The base docker-compose.yml runs CPU-only by default.
+# ============================================================
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

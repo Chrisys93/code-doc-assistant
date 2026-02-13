@@ -1,0 +1,20 @@
+# ============================================================
+# Docker Compose Override — CPU-Only (No GPU)
+# ============================================================
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build
+#
+# Or use the helper script:
+#   ./run-cpu.sh
+#
+# This override removes the NVIDIA GPU reservation from the
+# Ollama service, allowing it to run on CPU-only machines.
+# Expect slower inference (~10-30s per response with Phi-3.5).
+# ============================================================
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices: []

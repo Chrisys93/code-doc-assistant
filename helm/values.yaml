@@ -1,0 +1,86 @@
+# ============================================================
+# Code Documentation Assistant — Helm Values
+# ============================================================
+
+# --- Model Tier ---
+# Controls which Ollama model is deployed and how resources are allocated.
+# Options: "full", "balanced", "lightweight"
+#
+#   full        → Mistral Nemo (12B) — best quality, needs GPU + 12Gi RAM
+#   balanced    → Qwen2.5-Coder 7B  — solid quality, ~8Gi RAM
+#   lightweight → Phi-3.5 Mini (3.8B) — edge/low-resource, ~4Gi RAM
+#
+# Override at install time:
+#   helm install code-doc-assistant ./helm/code-doc-assistant --set modelTier=lightweight
+#
+modelTier: "full"
+
+# --- Embedding Model ---
+# Controls which embedding model is used for vectorising code chunks.
+# WARNING: Changing this after ingestion requires full re-ingestion of the codebase.
+# The vector dimension is derived automatically by _helpers.tpl.
+#
+#   default     → nomic-embed-text (768-dim) — good all-rounder for code + text
+#   lightweight → all-minilm (384-dim) — smaller vectors, faster search, less memory
+#   rich        → mxbai-embed-large (1024-dim) — richer representation, more memory
+#
+# Override at install time:
+#   helm install code-doc-assistant ./helm/code-doc-assistant --set embeddingModel=lightweight
+#
+embeddingModel: "default"
+
+# --- Ollama ---
+ollama:
+  image:
+    repository: ollama/ollama
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    port: 11434
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""  # uses cluster default
+
+# --- Application (Streamlit UI + RAG pipeline) ---
+app:
+  image:
+    repository: code-doc-assistant
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 1
+  service:
+    type: ClusterIP
+    port: 8501  # Streamlit default
+    # For multi-node private network access, set type to NodePort:
+    #   helm install ... --set app.service.type=NodePort --set app.service.nodePort=30501
+    nodePort: ""  # only used when type=NodePort (must be 30000-32767)
+  env:
+    # These can be overridden but typically are derived from helpers
+    OLLAMA_HOST: ""  # auto-set by templates if empty
+    LOG_LEVEL: "info"
+
+# --- Vector DB (ChromaDB) ---
+vectordb:
+  image:
+    repository: chromadb/chroma
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    port: 8000
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""
+
+# --- Ingress (optional) ---
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: code-doc-assistant.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []

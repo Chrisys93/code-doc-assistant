@@ -1,0 +1,6 @@
+apiVersion: v2
+name: code-doc-assistant
+description: A conversational AI assistant for code documentation, powered by Ollama
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

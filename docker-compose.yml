@@ -1,0 +1,114 @@
+# ============================================================
+# Code Documentation Assistant — Docker Compose (Local Dev)
+# ============================================================
+# Usage:
+#   docker compose up                          # default: full tier
+#   MODEL_TIER=lightweight docker compose up   # lightweight tier
+#   docker compose up --build                  # rebuild after code changes
+#
+# Access: http://localhost:8501
+# ============================================================
+
+services:
+  # --- Ollama (LLM inference server) ---
+  ollama:
+    image: ollama/ollama:latest
+    container_name: code-doc-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    # GPU acceleration is optional — Ollama falls back to CPU if no GPU available.
+    # To enable GPU: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+    # See docker-compose.gpu.yml for NVIDIA GPU reservation.
+
+  # --- Model Bootstrap ---
+  # Pulls the LLM and embedding models on first startup.
+  # Runs once then exits — the models persist in the ollama_data volume.
+  ollama-bootstrap:
+    image: ollama/ollama:latest
+    container_name: code-doc-bootstrap
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=ollama:11434
+      - MODEL_TIER=${MODEL_TIER:-full}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+    entrypoint: >
+      bash -c '
+        echo "=== Bootstrapping models ==="
+
+        # Resolve LLM model from tier
+        case "$${MODEL_TIER}" in
+          full)        MODEL="mistral-nemo" ;;
+          balanced)    MODEL="qwen2.5-coder:7b" ;;
+          lightweight) MODEL="phi3.5" ;;
+          *)           MODEL="mistral-nemo" ;;
+        esac
+
+        echo "Pulling LLM: $${MODEL} (tier: $${MODEL_TIER})"
+        ollama pull $${MODEL}
+
+        echo "Pulling embedding model: $${EMBEDDING_MODEL}"
+        ollama pull $${EMBEDDING_MODEL}
+
+        echo "=== Bootstrap complete ==="
+      '
+    restart: "no"
+
+  # --- ChromaDB (Vector Database) ---
+  chromadb:
+    image: chromadb/chroma:0.6.3
+    container_name: code-doc-chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - ANONYMIZED_TELEMETRY=false
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/heartbeat')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --- Application (Streamlit UI + RAG pipeline) ---
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: code-doc-app
+    ports:
+      - "8501:8501"
+    depends_on:
+      ollama:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - CHROMA_HOST=http://chromadb:8000
+      - MODEL_TIER=${MODEL_TIER:-full}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      # Mount a local repo for ingestion (optional)
+      - ${REPO_PATH:-./repos}:/data/repos:ro
+
+volumes:
+  ollama_data:
+    driver: local
+  chroma_data:
+    driver: local

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vector DB local data
+chroma_data/
+qdrant_data/
+
+# Cloned repos for ingestion
+repos/
+
+# README versioning
+READMEv0.md
