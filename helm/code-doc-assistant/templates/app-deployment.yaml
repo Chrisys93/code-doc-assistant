@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "code-doc-assistant.fullname" . }}-app
+  labels:
+    {{- include "code-doc-assistant.labels" . | nindent 4 }}
+    app.kubernetes.io/component: app
+spec:
+  replicas: {{ .Values.app.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
+      app.kubernetes.io/component: app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
+        app.kubernetes.io/component: app
+    spec:
+      containers:
+        - name: app
+          image: "{{ .Values.app.image.repository }}:{{ .Values.app.image.tag }}"
+          imagePullPolicy: {{ .Values.app.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.app.service.port }}
+              name: http
+          env:
+            - name: OLLAMA_HOST
+              value: {{ include "code-doc-assistant.ollamaHost" . }}
+            - name: CHROMA_HOST
+              value: "http://{{ include "code-doc-assistant.fullname" . }}-chromadb:{{ .Values.vectordb.service.port }}"
+            - name: MODEL_TIER
+              value: {{ .Values.modelTier | quote }}
+            - name: OLLAMA_MODEL
+              value: {{ include "code-doc-assistant.ollamaModel" . }}
+            - name: EMBEDDING_MODEL
+              value: {{ include "code-doc-assistant.embeddingModel" . }}
+            - name: EMBEDDING_DIMENSION
+              value: {{ include "code-doc-assistant.embeddingDimension" . | quote }}
+            - name: CHUNKING_STRATEGY
+              value: {{ include "code-doc-assistant.chunkingStrategy" . }}
+            - name: LOG_LEVEL
+              value: {{ .Values.app.env.LOG_LEVEL | quote }}
+          readinessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+            # --- Dev branch additions ---
+            - name: INFERENCE_BACKEND
+              value: {{ .Values.inferenceBackend | quote }}
+            - name: VLLM_HOST
+              value: {{ include "code-doc-assistant.vllmHost" . }}
+            - name: MLFLOW_TRACKING_URI
+              value: {{ include "code-doc-assistant.mlflowHost" . }}
+            - name: HITL_ENABLED
+              value: {{ .Values.hitlEnabled | quote }}
+            - name: OUTPUT_REVIEW_MODE
+              value: {{ .Values.outputReviewMode | quote }}
+            - name: QUALITY_GATE_THRESHOLD
+              value: {{ .Values.qualityGateThreshold | quote }}
+            - name: CONFIDENCE_THRESHOLD
+              value: {{ .Values.confidenceThreshold | quote }}
+            - name: MAX_RETRIEVAL_ATTEMPTS
+              value: {{ .Values.maxRetrievalAttempts | quote }}
+            - name: MAX_GENERATION_ATTEMPTS
+              value: {{ .Values.maxGenerationAttempts | quote }}
+            - name: MAX_CONTEXT_TOKENS
+              value: {{ .Values.maxContextTokens | quote }}

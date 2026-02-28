@@ -1,0 +1,102 @@
+---
+# Ollama Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "code-doc-assistant.fullname" . }}-ollama
+  labels:
+    {{- include "code-doc-assistant.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.ollama.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
+    app.kubernetes.io/component: ollama
+---
+# ChromaDB Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "code-doc-assistant.fullname" . }}-chromadb
+  labels:
+    {{- include "code-doc-assistant.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vectordb
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.vectordb.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
+    app.kubernetes.io/component: vectordb
+---
+# Application Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "code-doc-assistant.fullname" . }}-app
+  labels:
+    {{- include "code-doc-assistant.labels" . | nindent 4 }}
+    app.kubernetes.io/component: app
+spec:
+  type: {{ .Values.app.service.type }}
+  ports:
+    - port: {{ .Values.app.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+      {{- if and (eq .Values.app.service.type "NodePort") .Values.app.service.nodePort }}
+      nodePort: {{ .Values.app.service.nodePort }}
+      {{- end }}
+  selector:
+    app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
+    app.kubernetes.io/component: app
+---
+# MLflow Service (dev branch)
+{{- if .Values.mlflow.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "code-doc-assistant.fullname" . }}-mlflow
+  labels:
+    {{- include "code-doc-assistant.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mlflow
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.mlflow.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
+    app.kubernetes.io/component: mlflow
+{{- end }}
+---
+# vLLM Service (dev branch — only when inferenceBackend=vllm)
+{{- if eq .Values.inferenceBackend "vllm" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "code-doc-assistant.fullname" . }}-vllm
+  labels:
+    {{- include "code-doc-assistant.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vllm
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.vllm.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
+    app.kubernetes.io/component: vllm
+{{- end }}

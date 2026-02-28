@@ -1,0 +1,135 @@
+# ============================================================
+# Code Documentation Assistant — Helm Values (dev branch)
+# ============================================================
+
+# --- Agent Behaviour ---
+# Controls post-generation quality gate. Cascades via _helpers.tpl → app env.
+#
+#   human       → HITL-2: pause and wait for human rating + decision
+#   supervisor  → Supervisor LLM evaluates output against rubric; silent retry if fail
+#   self        → Generation LLM self-critiques before emitting (no extra node)
+#   off         → No post-generation check; accept immediately
+#
+# Override at install time:
+#   helm install ... --set outputReviewMode=supervisor
+#
+outputReviewMode: "human"
+qualityGateThreshold: 6.0
+maxGenerationAttempts: 3
+hitlEnabled: true
+confidenceThreshold: 0.45
+maxRetrievalAttempts: 3
+maxContextTokens: 8000
+
+# --- Inference Backend ---
+# "ollama" (default) — Ollama StatefulSet, CPU fallback available.
+# "vllm"             — vLLM Deployment, GPU required, OpenAI-compatible API.
+#
+# Override at install time:
+#   helm install ... --set inferenceBackend=vllm
+#
+inferenceBackend: "ollama"
+
+# --- vLLM (only active when inferenceBackend=vllm) ---
+vllm:
+  image:
+    repository: vllm/vllm-openai
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    port: 8000
+  model: ""           # resolved from modelTier by _helpers.tpl if empty
+  tensorParallelSize: 1
+  maxModelLen: 32768
+  gpuMemoryUtilization: "0.90"
+
+# --- Model Tier ---
+# Controls which model is deployed and how resources are allocated.
+# Options: "full", "balanced", "lightweight"
+#
+#   full        → Mistral Nemo (12B) — best quality, needs GPU + 12Gi RAM
+#   balanced    → Qwen2.5-Coder 7B  — solid quality, ~8Gi RAM
+#   lightweight → Phi-3.5 Mini (3.8B) — edge/low-resource, ~4Gi RAM
+#
+modelTier: "full"
+
+# --- Embedding Model ---
+# WARNING: Changing this after ingestion requires full re-ingestion.
+# Vector dimension is derived automatically by _helpers.tpl.
+#
+#   default     → nomic-embed-text (768-dim)
+#   lightweight → all-minilm (384-dim)
+#   rich        → mxbai-embed-large (1024-dim)
+#
+embeddingModel: "default"
+
+# --- Ollama ---
+ollama:
+  image:
+    repository: ollama/ollama
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    port: 11434
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+
+# --- Application (Streamlit UI + LangGraph agent) ---
+app:
+  image:
+    repository: code-doc-assistant
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 1
+  service:
+    type: ClusterIP
+    port: 8501
+  env:
+    OLLAMA_HOST: ""       # auto-set by _helpers.tpl
+    VLLM_HOST: ""         # auto-set by _helpers.tpl when inferenceBackend=vllm
+    OLLAMA_MODEL: ""      # auto-set by _helpers.tpl from modelTier
+    MLFLOW_TRACKING_URI: ""  # auto-set by _helpers.tpl to in-cluster MLflow
+    LOG_LEVEL: "info"
+
+# --- Vector DB (ChromaDB) ---
+vectordb:
+  image:
+    repository: chromadb/chroma
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    port: 8000
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""
+
+# --- MLflow tracking server ---
+mlflow:
+  enabled: true
+  image:
+    repository: ghcr.io/mlflow/mlflow
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    port: 5000
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: ""
+  backendStoreUri: "sqlite:////mlflow/mlflow.db"
+  defaultArtifactRoot: "/mlflow/artifacts"
+
+# --- Ingress (optional) ---
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: code-doc-assistant.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
