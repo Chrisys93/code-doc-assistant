@@ -54,7 +54,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import mlflow
 from langchain_ollama import ChatOllama
@@ -67,7 +67,7 @@ from agent_state import (
     AgentState, Chunk, HITLCheckpoint, PostGenerationFeedback,
     SessionPreferences, SupervisorAdjustment, ToolCall
 )
-from tools import TOOL_REGISTRY, run_tool
+from tools import build_tool_registry, run_tool
 
 # ---------------------------------------------------------------------------
 # Configuration from environment
@@ -169,9 +169,12 @@ Example:
 
 def node_tool_selection(state: AgentState) -> dict[str, Any]:
     """LLM proposes a tool plan for the given query."""
+    # build_tool_registry() filters MCP tools by is_mcp_capable() + server enabled state,
+    # so the LLM is only offered tools it can actually use.
+    registry = build_tool_registry()
     tool_descs = "\n".join(
         f"  - {name}: {meta['description']}"
-        for name, meta in TOOL_REGISTRY.items()
+        for name, meta in registry.items()
     )
     system_msg = TOOL_SELECTION_SYSTEM.format(tool_descriptions=tool_descs)
     user_msg = f"Query: {state['query']}\nRepo path: {state['repo_path']}"
@@ -886,6 +889,7 @@ def run_agent(query: str, repo_path: str, thread_id: str = "default",
         "post_generation_feedback": None,
         "session_preferences": None,
         "generation_attempts": 0,
+        "execution_trace": [],
         "mlflow_run_id": None,
         "total_latency_ms": None,
         **(extra_state or {}),
