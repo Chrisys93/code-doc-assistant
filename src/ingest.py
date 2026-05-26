@@ -1,10 +1,16 @@
 """
 Codebase ingestion pipeline.
 
-Handles: repo cloning → file discovery → AST-aware chunking → embedding → vector storage.
+Handles: repo cloning → file discovery → AST-aware chunking → embedding
+         → vector storage → graph construction (dependency + co-change)
 
-Uses LlamaIndex's CodeSplitter (tree-sitter) for AST-aware chunking with
-a fixed-window fallback for files that can't be parsed.
+The graph construction step runs after the vector index is built, using the
+same file list and tree-sitter parse. It writes to a Kuzu embedded graph DB
+(a directory on disk, no new services) alongside the ChromaDB volume.
+
+Graph construction is opt-in via GRAPH_ENABLED env var (default: true when
+kuzu is installed). It does not affect the vector index or query pipeline —
+graph tools are additive to the existing tool registry.
 """
 
 import os
@@ -19,7 +25,7 @@ from llama_index.core.node_parser import CodeSplitter, SentenceSplitter
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 
-from src.config import (
+from config import (
     OLLAMA_HOST,
     OLLAMA_MODEL,
     EMBEDDING_MODEL,
@@ -29,9 +35,17 @@ from src.config import (
     CHUNKING_STRATEGY,
     TOP_K,
 )
-from src.vector_store import ChromaVectorStoreImpl
+from vector_store import ChromaVectorStoreImpl
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Graph config — resolved from environment
+# ---------------------------------------------------------------------------
+
+GRAPH_ENABLED = os.environ.get("GRAPH_ENABLED", "true").lower() == "true"
+GRAPH_PATH = os.environ.get("GRAPH_PATH", "/data/graph")
+GRAPH_CO_CHANGE_COMMITS = int(os.environ.get("GRAPH_CO_CHANGE_COMMITS", "100"))
 
 # File extensions to ingest, mapped to tree-sitter language identifiers
 LANGUAGE_MAP = {
@@ -85,14 +99,12 @@ def clone_repo(repo_url: str, target_dir: Optional[str] = None) -> str:
 def discover_files(repo_path: str) -> list[dict]:
     """
     Walk the repo and return a list of files to ingest.
-
     Returns dicts with: path, relative_path, extension, language (if code)
     """
     files = []
     repo_root = Path(repo_path)
 
     for root, dirs, filenames in os.walk(repo_root):
-        # Prune skip directories in-place
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
 
         for fname in filenames:
@@ -134,7 +146,6 @@ def load_and_chunk_files(files: list[dict]) -> list:
     """
     documents = []
 
-    # Read all files into LlamaIndex Documents with metadata
     for file_info in files:
         try:
             with open(file_info["path"], "r", encoding="utf-8", errors="replace") as f:
@@ -158,15 +169,11 @@ def load_and_chunk_files(files: list[dict]) -> list:
 
     logger.info(f"Loaded {len(documents)} documents")
 
-    # Split code files with CodeSplitter, text files with SentenceSplitter
     code_docs = [d for d in documents if d.metadata.get("file_type") == "code"]
     text_docs = [d for d in documents if d.metadata.get("file_type") == "text"]
-
     all_nodes = []
 
-    # AST-aware chunking for code (if strategy allows)
     if code_docs and CHUNKING_STRATEGY == "ast":
-        # Group by language for correct parser selection
         by_language = {}
         for doc in code_docs:
             lang = doc.metadata.get("language", "python")
@@ -184,32 +191,20 @@ def load_and_chunk_files(files: list[dict]) -> list:
                 all_nodes.extend(nodes)
                 logger.info(f"  {language}: {len(lang_docs)} files → {len(nodes)} chunks (AST)")
             except Exception as e:
-                # Fallback to sentence splitter if tree-sitter fails
                 logger.warning(f"  {language}: AST parsing failed ({e}), using text fallback")
-                fallback = SentenceSplitter(
-                    chunk_size=CHUNK_SIZE,
-                    chunk_overlap=CHUNK_OVERLAP,
-                )
+                fallback = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
                 nodes = fallback.get_nodes_from_documents(lang_docs)
                 all_nodes.extend(nodes)
                 logger.info(f"  {language}: {len(lang_docs)} files → {len(nodes)} chunks (fallback)")
     elif code_docs:
-        # Text-based chunking for code (lightweight tier or explicit config)
         logger.info(f"  Using text-based chunking for code (strategy={CHUNKING_STRATEGY})")
-        text_splitter = SentenceSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-        )
+        text_splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
         nodes = text_splitter.get_nodes_from_documents(code_docs)
         all_nodes.extend(nodes)
         logger.info(f"  code: {len(code_docs)} files → {len(nodes)} chunks (text)")
 
-    # Text-based chunking for docs/config
     if text_docs:
-        text_splitter = SentenceSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-        )
+        text_splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
         nodes = text_splitter.get_nodes_from_documents(text_docs)
         all_nodes.extend(nodes)
         logger.info(f"  text/config: {len(text_docs)} files → {len(nodes)} chunks")
@@ -222,16 +217,11 @@ def build_index(
     nodes: list,
     vector_store_impl: ChromaVectorStoreImpl,
 ) -> VectorStoreIndex:
-    """
-    Embed chunks and store in the vector database.
-
-    Returns a VectorStoreIndex ready for querying.
-    """
+    """Embed chunks and store in the vector database."""
     embed_model = OllamaEmbedding(
         model_name=EMBEDDING_MODEL,
         base_url=OLLAMA_HOST,
     )
-
     vector_store = vector_store_impl.get_vector_store()
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
@@ -246,15 +236,12 @@ def build_index(
     return index
 
 
-def load_existing_index(
-    vector_store_impl: ChromaVectorStoreImpl,
-) -> VectorStoreIndex:
+def load_existing_index(vector_store_impl: ChromaVectorStoreImpl) -> VectorStoreIndex:
     """Load an existing index from the vector store (no re-ingestion)."""
     embed_model = OllamaEmbedding(
         model_name=EMBEDDING_MODEL,
         base_url=OLLAMA_HOST,
     )
-
     vector_store = vector_store_impl.get_vector_store()
     index = VectorStoreIndex.from_vector_store(
         vector_store=vector_store,
@@ -264,18 +251,57 @@ def load_existing_index(
     return index
 
 
+def build_graphs(files: list[dict], repo_path: str, reset: bool = True) -> None:
+    """
+    Build the dependency graph and co-change graph as a parallel output
+    of the ingestion pipeline.
+
+    Called after the vector index is built, using the same file list.
+    No-op if GRAPH_ENABLED=false or kuzu is not installed.
+
+    Args:
+        files:     output of discover_files()
+        repo_path: repo root (for git log and import resolution)
+        reset:     if True, clears existing graph before building
+    """
+    if not GRAPH_ENABLED:
+        logger.info("Graph build skipped (GRAPH_ENABLED=false)")
+        return
+
+    try:
+        from graph_store import KuzuGraphStore, build_dependency_graph, build_co_change_graph
+    except ImportError:
+        logger.warning("graph_store module not found — skipping graph build")
+        return
+
+    graph_store = KuzuGraphStore(GRAPH_PATH)
+    if not graph_store.available:
+        return
+
+    if reset:
+        graph_store.reset()
+
+    build_dependency_graph(files, graph_store, repo_path)
+    build_co_change_graph(graph_store, repo_path, n_commits=GRAPH_CO_CHANGE_COMMITS)
+    logger.info("Graph build complete")
+
+
 def ingest_codebase(
     repo_path: str,
     vector_store_impl: ChromaVectorStoreImpl,
     reset: bool = True,
 ) -> VectorStoreIndex:
     """
-    Full ingestion pipeline: discover → chunk → embed → store.
+    Full ingestion pipeline: discover → chunk → embed → store → build graphs.
+
+    The graph build step is additive — it runs after the vector index is
+    complete and does not affect it. If graph build fails, the vector index
+    is still returned successfully.
 
     Args:
-        repo_path: Local path to the codebase
+        repo_path:         Local path to the codebase
         vector_store_impl: Vector store to write to
-        reset: If True, clear existing vectors before ingesting
+        reset:             If True, clear existing vectors and graph before ingesting
 
     Returns:
         VectorStoreIndex ready for querying
@@ -289,4 +315,11 @@ def ingest_codebase(
 
     nodes = load_and_chunk_files(files)
     index = build_index(nodes, vector_store_impl)
+
+    # Graph construction — parallel output, does not affect vector index
+    try:
+        build_graphs(files, repo_path, reset=reset)
+    except Exception as e:
+        logger.warning(f"Graph build failed (non-fatal): {e}")
+
     return index

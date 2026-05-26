@@ -1,16 +1,13 @@
 # ============================================================
-# Code Documentation Assistant — dev branch requirements
+# Code Documentation Assistant — Python Dependencies
+# ============================================================
+# Pinned versions match docker-compose and helm chart images.
+# Install: pip install -r requirements.txt
 # ============================================================
 
-# --- LangGraph + LangChain (agent orchestration) ---
-langgraph>=0.2.0
-langchain>=0.3.0
-langchain-core>=0.3.0
-langchain-ollama>=0.2.0
-langchain-openai>=0.2.0        # vLLM OpenAI-compatible endpoint
-langchain-community>=0.3.0
-
-# --- RAG / ingestion pipeline (retained from main) ---
+# --- RAG framework (LlamaIndex) ---
+# Used by ingestion pipeline (ingest.py) — unchanged from master.
+# NOT used by the dev agent query path (LangGraph handles that).
 llama-index-core>=0.11.0
 llama-index-llms-ollama>=0.3.0
 llama-index-embeddings-ollama>=0.3.0
@@ -18,28 +15,36 @@ llama-index-vector-stores-chroma>=0.2.0
 llama-index-readers-file>=0.2.0
 llama-index-readers-github>=0.2.0
 
-# --- Vector DB ---
-chromadb==0.6.3                # pinned — matches main branch
+# --- Agent pipeline (LangGraph / LangChain) ---
+# dev branch query path. Replaces LlamaIndex for agent orchestration.
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-ollama>=0.2.0
+langchain-openai>=0.2.0          # used for vLLM OpenAI-compatible endpoint
 
-# --- Code parsing ---
+# --- Vector DB ---
+chromadb==0.6.3                  # pinned — matches helm chart + docker-compose images
+
+# --- Graph DB ---
+# Embedded, no server required. Zero new infrastructure.
+# Install is optional — graph features degrade gracefully if absent.
+kuzu>=0.6.0
+
+# --- MCP client ---
+# Required for MCP-backed tools (fs_read, github_*, slack_*).
+# Only used when MCP_*_ENABLED=true and is_mcp_capable() returns True.
+mcp>=1.0.0
+
+# --- Experiment tracking ---
+mlflow>=2.14.0
+
+# --- Code parsing (AST-aware chunking + graph build) ---
 tree-sitter>=0.21.0
 tree-sitter-language-pack>=0.1.0
 
-# --- Inference backends ---
-# Ollama: via langchain-ollama above (default)
-# vLLM:   exposes OpenAI-compatible API — langchain-openai handles both.
-#         vLLM itself is not pip-installed: it runs in its own container
-#         (docker-compose.dev.yml profile: vllm)
-
-# --- Experiment tracking ---
-mlflow>=2.15.0
-
 # --- UI ---
 streamlit>=1.37.0
-
-# --- Workflow orchestration client ---
-# Argo Workflows runs cluster-side; the Python client submits WorkflowTemplates
-argo-workflows>=6.3.0
 
 # --- Utilities ---
 python-dotenv>=1.0.0

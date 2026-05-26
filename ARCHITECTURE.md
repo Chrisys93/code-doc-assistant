@@ -449,3 +449,255 @@ These are genuinely research-level questions — not implementation items — bu
 - Configuration: environment-variable driven, with parity between Docker Compose and Helm at every layer
 - Testing: pipeline validation with embedded ChromaDB; AST chunking verification; graph topology validation (`dev`)
 - Logging: structured logging via Python `logging` module, configurable level; MLflow for experiment-level tracking
+
+---
+
+## Phase 13: RLHF Pipeline — Preference Learning from HITL Feedback
+
+### Why this belongs in the `orchestrated` branch, not a separate track
+
+The RLHF pipeline is not an independent research concern — it is the natural downstream of what the HITL design was always pointing toward. `PostGenerationFeedback` already captures the preference signal (accepted vs rejected/regenerated responses, satisfaction scores 1–5, format and context notes). MLflow already logs it across runs. The infrastructure for collecting preference pairs exists; RLHF is what you do with them.
+
+The `orchestrated` research branch is the right home for this — as an extension of the PEFT work already scoped there, not as a standalone track. The fine-tuning branch uses static Q&A pairs; the orchestrated branch closes the loop by using live preference signal to drive continuous adaptation. The connection is direct.
+
+### Preference data already being collected
+
+Every HITL-2 interaction produces a structured preference record:
+
+- **Chosen**: the response the developer accepted (satisfaction ≥ threshold, decision = `accept`)
+- **Rejected**: the response they asked to regenerate (decision = `regenerate`), with notes on why
+- **Context**: which tools were called, which chunks were retrieved, what the supervisor adjusted
+
+This is a DPO-compatible preference dataset being generated passively during normal use. MLflow run IDs tie each preference pair to its full execution trace, making the dataset auditable and filterable.
+
+### PEFT approaches under consideration
+
+Three PEFT families are relevant, in increasing order of complexity:
+
+**LoRA / QLoRA** — the baseline approach already scoped in the `fine-tuning` branch. Low-rank adapter layers trained on Q&A pairs. QLoRA extends this to quantised base models (4-bit), making fine-tuning feasible on a single consumer GPU. Well-understood, widely supported, the right starting point.
+
+**Soft prompts (prompt tuning)** — a lighter-weight alternative to weight updates. Instead of adapting model weights, a set of learnable continuous token embeddings is prepended to every prompt. The model weights are frozen; only the soft prompt vectors are trained. Key properties:
+- Significantly lower memory and compute requirements than LoRA
+- No weight merging or adapter management — the soft prompt is a small tensor, easily versioned and swapped
+- Effective at steering model behaviour toward a particular style or domain without catastrophic forgetting risk
+- Less expressive than LoRA for large distribution shifts, but well-suited to the narrower task here (code documentation style alignment)
+- Natural fit for the `format_notes` field in `PostGenerationFeedback` — style preferences accumulate into a learnable prompt bias
+
+**DPO (Direct Preference Optimisation)** — trains directly on preference pairs (chosen vs rejected) without a separate reward model. Simpler and more stable than PPO-based RLHF, and directly compatible with the MLflow preference dataset. This is the primary RLHF technique to implement in the `orchestrated` branch. Soft prompts and DPO are complementary: soft prompts handle style alignment, DPO handles quality alignment.
+
+**PPO-based RLHF** — the full pipeline: reward model trained on preference pairs, PPO updates the policy. Most powerful but most complex. Deferred to a later phase once DPO results are characterised.
+
+### Relationship to the branching structure
+
+```
+fine-tuning branch   → LoRA/QLoRA on static Q&A pairs
+orchestrated branch  → soft prompts + DPO on live HITL preference pairs from MLflow
+```
+
+The jump from "collect feedback" to "train on feedback" is smaller than it appears — the infrastructure is already there. This is not a new research direction; it is the completion of what the HITL design implied from the beginning.
+
+---
+
+## Phase 14: Helm Deployment Knobs — Composable Configuration Model
+
+### Three orthogonal axes
+
+The dev branch introduces three independently composable configuration values that together define the full deployment profile:
+
+```yaml
+modelTier:       "full" | "balanced" | "lightweight" | "minimal"
+quantisation:    "q4_K_M" | "q8_0" | "fp16"
+deploymentTarget: "local" | "cluster"
+```
+
+These are orthogonal by design: `modelTier` is the capability selector, `quantisation` is the resource selector, and `deploymentTarget` is the infrastructure selector. You can tune memory vs quality vs deployment complexity independently at install time.
+
+### `modelTier` — capability selector
+
+| Tier | Model | Notes |
+|---|---|---|
+| `full` | mistral-nemo:12b-instruct | Best quality, GPU + 12Gi+ RAM |
+| `balanced` | deepseek-coder-v2:16b-lite-instruct | Best code understanding at mid-range |
+| `lightweight` | phi3.5 | Edge/low-resource, ~4Gi RAM |
+| `minimal` | qwen2.5-coder:3b-instruct | CI pipelines / very constrained dev |
+
+The `minimal` tier is specifically intended for CI pipeline runs and constrained developer machines where the goal is pipeline validation, not output quality.
+
+### `quantisation` — resource selector
+
+Composed with `modelTier` by `_helpers.tpl` to produce the final Ollama model tag:
+
+| Value | Suffix | Memory impact |
+|---|---|---|
+| `q4_K_M` | `-q4_K_M` | ~50% reduction, minimal quality loss |
+| `q8_0` | `-q8_0` | ~25% reduction, near lossless |
+| `fp16` | (none) | Full precision, full footprint |
+
+`phi3.5` and `qwen2.5-coder:3b` use Ollama's default quantisation (already Q4), so no suffix is appended for `lightweight` and `minimal` tiers.
+
+Example compositions:
+- `balanced` + `q4_K_M` → `deepseek-coder-v2:16b-lite-instruct-q4_K_M` (~6Gi)
+- `full` + `q8_0` → `mistral-nemo:12b-instruct-q8_0` (~12Gi)
+- `full` + `fp16` → `mistral-nemo:12b-instruct` (~14Gi)
+
+### `deploymentTarget` — infrastructure selector
+
+Controls resource profiles, storage backends, healthcheck intervals, and ChromaDB HNSW tuning.
+
+**`local`** (developer laptop / single-node):
+- No resource requests/limits on app or Ollama containers (meaningless on dev machines, can cause unnecessary scheduling friction)
+- Lighter healthcheck intervals to reduce startup noise
+- ChromaDB HNSW `searchEf` reduced to 20 (faster queries, less accurate — acceptable for single-user dev)
+- ChromaDB persistence uses host-path volumes
+- MLflow uses local SQLite backend
+
+**`cluster`** (production Kubernetes):
+- Resource requests/limits enforced, scaled by `modelTier` + `quantisation`
+- Full HNSW `searchEf` from `values.yaml` (better recall for concurrent load)
+- PVCs for all stateful services (ChromaDB, MLflow, Ollama)
+- External MLflow URI supported
+- GPU node selector applied for `full` tier
+
+### ChromaDB HNSW tuning
+
+HNSW parameters are now explicitly configured in `values.yaml` under `vectordb.hnsw` and propagated via `_helpers.tpl`. Previously only `hnsw:space: cosine` was set; the remaining parameters defaulted to ChromaDB's global defaults (which are not tuned for this workload).
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `M` | 16 | Bidirectional links per node — higher = better recall, more memory |
+| `constructionEf` | 100 | Candidate list size at build time — higher = better recall, slower build |
+| `searchEf` | 50 (cluster) / 20 (local) | Candidate list size at query time — higher = better recall, slower query |
+
+These values are reasonable defaults for collections in the tens-of-thousands of chunks range. For significantly larger collections, `M: 32` and `constructionEf: 200` are worth evaluating.
+
+
+---
+
+## Phase 15: MCP Integration — Split Tool Registry
+
+### Design: split registry over unified wrapper
+
+Tools are divided into two explicit categories with a unified dispatch surface:
+
+```
+LOCAL_TOOL_REGISTRY  — plain Python callables, always available, no LLM capability requirement
+MCP_TOOL_REGISTRY    — MCP-backed tools, offered only when is_mcp_capable() is True
+TOOL_REGISTRY        — unified view built at graph time; what node_tool_selection sees
+```
+
+The split is architecturally intentional rather than incidental. A unified wrapper that presents both tool types identically to the LLM would silently degrade for lightweight and minimal tier models — those models often cannot reliably produce the structured JSON that MCP tool calls require. The split makes this explicit: `is_mcp_capable()` returns True only for `full` and `balanced` tiers, and `build_tool_registry()` filters accordingly. Local tools are always available; MCP tools are only offered when the LLM can use them.
+
+This also preserves the duality of approach: different LLMs and different deployment configurations use the same codebase, routing to the tool subset appropriate for their capabilities. A `minimal`-tier CI run gets the full local toolset; a `full`-tier interactive session gets local + MCP.
+
+### MCP servers included on `dev`
+
+**Filesystem MCP** — replaces the bespoke `_safe_path` + subprocess allowlist for file access with a declarative permission map:
+
+| Access tier | Paths |
+|---|---|
+| read-only | source files (`*.py`, `*.ts`, `*.yaml`, `*.md`, configs) |
+| read-write | generated artefacts (`docs/`, `reports/`, `*.generated.*`) |
+| execute | blocked entirely |
+
+The local `tool_cat`, `tool_find`, and `tool_stat` remain in `LOCAL_TOOL_REGISTRY` as fallbacks and are used unconditionally by lower-tier models. Filesystem MCP tools (`fs_read`, `fs_write`, `fs_list`) are preferred for MCP-capable LLMs — access control is declarative and auditable at the server level rather than enforced through Python path validation.
+
+**GitHub MCP** — replaces `tool_github_fetch` for external repo operations and extends it:
+- `github_get_file` — OAuth-handled file fetch, rate-limit aware
+- `github_list_prs` — list open PRs; useful for correlating code with PR descriptions
+- `github_get_pr_diff` — full diff for a PR; best for documenting what a feature branch changed
+- `github_get_issue` — issue body and comments; understanding intent behind a change
+
+Commit and push operations are explicitly excluded on `dev`. The documentation agent reads and reasons about the codebase; it does not write to it. CI/CD owns that.
+
+**Slack MCP** — serves two distinct purposes on `dev`:
+
+1. **Developer workflow**: query the assistant inline from Slack (`#code-review`, `#docs`) without opening the Streamlit UI. This makes the assistant ambient in the team's existing tool rather than a separate destination.
+2. **Self-documentation**: as a side-effect of a documentation run, the agent can post a summary to a relevant channel. The assistant becomes part of the team's knowledge flow, not just a query tool.
+
+This is a `dev`-branch concern, not a production commitment — in production, appropriate integrations depend on the deployment context and the assistant's role. The PoC/prototype framing here means Slack MCP is a demonstration of the pattern.
+
+### MCP servers deferred to research repo
+
+**Memory MCP** — cross-session preference persistence. `SessionPreferences` in `dev` is deliberately session-scoped (cleared on "Clear conversation", never persisted to MLflow as a model artefact). Memory MCP extends this: preferences accumulated across sessions become a persistent prior retrieved at the start of each session. This raises questions about preference drift, session boundary detection, and privacy that are out of scope for `dev`. Relevant to all research branches.
+
+**Qdrant MCP** — if `VECTOR_STORE_BACKEND=qdrant` is added (see Phase 14 extensions), the Qdrant MCP server gives the agent direct query access rather than going through the Python client. Relevant to both `orchestrated` (supervised retrieval strategy adaptation) and `emergent` (agents sharing vector state without a central coordinator). The `VectorStoreBase` abstraction already accommodates a `QdrantVectorStoreImpl` without changes to the agent graph.
+
+### Vector DB knob relevance at scale
+
+The `vectordb.hnsw.*` parameters and the `VECTOR_STORE_BACKEND` knob are modest optimisations for the current single-codebase, single-user context. Where they become significantly more relevant:
+
+- **Multi-agent systems**: agents sharing a vector store surface contention on HNSW index locks, making tuning load-dependent. Qdrant's payload filtering becomes more valuable when multiple agents query the same index with different scoping requirements.
+- **Research repo `emergent` branch**: agents coordinating through shared vector state (no central supervisor) need a vector DB that supports concurrent writers without coordination overhead. ChromaDB's single-node HNSW is a bottleneck; Qdrant or a distributed index is the right substrate.
+- **Research repo `orchestrated` branch**: retrieval strategy adaptation (adjusting index parameters based on preference signal) requires the vector DB to support parameter updates without full re-indexing. A research-level concern, not a dev concern.
+
+
+---
+
+## Phase 16: Graph Database — Structural Retrieval Alongside Vector Search
+
+### The core distinction
+
+Vector DB and graph DB are orthogonal retrieval mechanisms, not alternatives:
+
+| | Vector DB (ChromaDB) | Graph DB (Kuzu) |
+|---|---|---|
+| Query type | "What is semantically similar?" | "What is structurally related?" |
+| Answer | Approximate, ranked | Precise, enumerable |
+| Best for | Fuzzy conceptual questions | Traversal, multi-hop structural questions |
+| Needs embeddings? | Yes | No |
+| Example | "How does caching work?" | "What calls `node_supervisor`?" |
+
+Graph DB does not need vector embeddings at all. For structural/relational queries — call graphs, import chains, co-change relationships — it gives exact answers where the vector DB gives approximate ones. The hybrid pattern uses both: graph traversal to find the structural neighbourhood, then vector search within that neighbourhood for semantic depth.
+
+### Do knowledge graphs require vector DBs?
+
+No. This is an important clarification. A graph DB with only explicit, hand-crafted or AST-extracted relationships works entirely without embeddings. Embeddings only enter when you need semantic similarity as an edge — "conceptually related to", "similar purpose as". The three graph structures built here use no embeddings: all edges are structurally derived from AST parses and git history.
+
+### Three graph structures built during ingestion
+
+**Code dependency graph** — built from tree-sitter AST parse (the same parse already running for chunking). Nodes: `File`, `Function`, `Class`. Edges: `IMPORTS`, `DEFINES`, `CALLS`, `INHERITS`, `DEFINES_CLASS`. Enables precise call chain traversal and import relationship queries.
+
+**Co-change graph** — built from `git log --name-only`. Nodes: `File`. Edges: `CHANGED_TOGETHER` with a weight equal to co-occurrence count across commits. Captures *logical coupling* — files that change together even when not structurally linked. Enables: "if I change X, what else will likely need updating?"
+
+**Knowledge graph (documentation layer)** — deferred to research/orchestrated. Nodes: `Concept`, `DesignDecision`, `Component`. Edges: `IMPLEMENTS`, `DEPENDS_ON`, `DOCUMENTED_IN`, `REPLACED_BY`. Source: structured extraction from ARCHITECTURE.md and docstrings. This is where the full power of a knowledge graph — generic and specialised associations, multi-dimensional concept relationships, cross-codebase analogies — becomes relevant. The `orchestrated` branch's retrieval strategy adaptation particularly benefits here: rather than adjusting retrieval parameters blindly, the supervisor can reason about *which structural neighbourhood* is relevant to a query before deciding retrieval strategy.
+
+### Why Kuzu, not Neo4j
+
+Kuzu is not derived from Neo4j — they share only the openCypher query language (an open standard). The right mental model is "Neo4j : PostgreSQL :: Kuzu : SQLite". Kuzu is embedded (no server process), written in C++, Python-native, built at University of Waterloo (2022). Zero new services, zero new infrastructure — the graph DB is a directory on disk alongside the ChromaDB persistence volume, and a single `pip install kuzu`.
+
+### Integration in the pipeline
+
+Graph construction runs as the final step of `ingest_codebase()`, after the vector index is built, using the same `files` list. It is additive and non-blocking — if it fails, the vector index is returned successfully. Controlled by `GRAPH_ENABLED` env var (default: true when kuzu is installed).
+
+```
+ingest_codebase()
+  └── discover_files()          → files list
+  └── load_and_chunk_files()    → nodes
+  └── build_index()             → VectorStoreIndex  ← unchanged
+  └── build_graphs()            → KuzuGraphStore     ← new, parallel output
+        └── build_dependency_graph()   (AST-derived)
+        └── build_co_change_graph()    (git history)
+```
+
+### New tool: `graph_traverse`
+
+Added to `LOCAL_TOOL_REGISTRY` (always available, no MCP capability requirement). Seven query types:
+
+| query_type | Question answered |
+|---|---|
+| `callees` | What functions does this function call? (depth-limited) |
+| `callers` | What functions call this function? (depth-limited) |
+| `dependencies` | What files does this file import? |
+| `dependents` | What files import this file? |
+| `co_changed` | What files frequently change together with this one? |
+| `symbols` | What functions and classes are defined in this file? |
+| `cypher` | Raw Cypher for advanced/custom traversals |
+
+### Locality-sensitive domains and the path toward knowledge graphs
+
+Your intuition about locality-sensitive domains is the right framing. For queries with a natural locality in the code graph — "everything in this module", "everything that calls into this subsystem", "everything that changed with this PR" — the graph DB gives exact, bounded answers without relying on the vagaries of semantic similarity. This is particularly valuable in domains where terminology is dense and overloaded (a common function name appears in many contexts; the vector DB can't distinguish them structurally).
+
+The path from code dependency graph → knowledge graph is an enrichment of the same structure: starting with structurally-derived edges (CALLS, IMPORTS), adding semantically-derived edges (SIMILAR_PURPOSE, CONCEPTUALLY_RELATED), then adding provenance edges (MOTIVATED_BY, REPLACED_BY). As the graph becomes richer, it enables increasingly generic and increasingly specialised queries simultaneously — the knowledge graph is the same structure, just with more edge types and more heterogeneous nodes.
+
+This is explicitly `orchestrated` branch territory in the research repo: graph-aware retrieval strategy adaptation, where the supervisor doesn't just adjust retrieval parameters but reasons about which part of the graph is relevant to a query before retrieval begins.
+

@@ -10,9 +10,6 @@
 #   self        → Generation LLM self-critiques before emitting (no extra node)
 #   off         → No post-generation check; accept immediately
 #
-# Override at install time:
-#   helm install ... --set outputReviewMode=supervisor
-#
 outputReviewMode: "human"
 qualityGateThreshold: 6.0
 maxGenerationAttempts: 3
@@ -21,14 +18,67 @@ confidenceThreshold: 0.45
 maxRetrievalAttempts: 3
 maxContextTokens: 8000
 
+# --- Deployment Target ---
+# Controls resource profiles, storage backends, healthcheck intervals, and
+# ChromaDB HNSW tuning. Two values:
+#
+#   local   → developer laptop / single-node; no resource requests/limits;
+#             lighter healthcheck intervals; ChromaDB searchEf reduced to 20;
+#             host-path volumes; MLflow uses local sqlite
+#   cluster → production k8s; resource requests/limits enforced (scaled by
+#             modelTier + quantisation); full HNSW searchEf; PVCs for all
+#             stateful services; external MLflow URI supported
+#
+# Override at install time:
+#   helm install ... --set deploymentTarget=cluster
+#
+deploymentTarget: "local"
+
 # --- Inference Backend ---
 # "ollama" (default) — Ollama StatefulSet, CPU fallback available.
 # "vllm"             — vLLM Deployment, GPU required, OpenAI-compatible API.
 #
-# Override at install time:
-#   helm install ... --set inferenceBackend=vllm
-#
 inferenceBackend: "ollama"
+
+# --- Model Tier ---
+# Capability selector. Controls which base model is deployed.
+#
+#   full        → mistral-nemo:12b-instruct          best quality, GPU + 12Gi+ RAM
+#   balanced    → deepseek-coder-v2:16b-lite-instruct best code understanding at mid-range
+#   lightweight → phi3.5                              edge/low-resource, ~4Gi RAM
+#   minimal     → qwen2.5-coder:3b-instruct           CI pipelines / very constrained dev
+#
+# Override at install time:
+#   helm install ... --set modelTier=lightweight
+#
+modelTier: "full"
+
+# --- Quantisation ---
+# Resource selector. Composed with modelTier by _helpers.tpl to produce the
+# final Ollama model tag. Orthogonal to modelTier — tune memory vs quality
+# independently.
+#
+#   q4_K_M  → ~50% memory reduction, minimal quality loss  (recommended default)
+#   q8_0    → ~25% memory reduction, near lossless
+#   fp16    → no suffix applied, full precision / full footprint
+#
+# Note: lightweight and minimal tiers use Ollama's built-in default quantisation
+# (already Q4); quantisation suffix is not appended for those tiers.
+#
+# Override at install time:
+#   helm install ... --set quantisation=q8_0
+#
+quantisation: "q4_K_M"
+
+# --- Embedding Model ---
+# WARNING: Changing this after ingestion requires full re-ingestion.
+# Vector dimension is resolved automatically by _helpers.tpl.
+#
+#   default     → nomic-embed-text (768-dim)
+#   lightweight → all-minilm (384-dim)
+#   rich        → mxbai-embed-large (1024-dim)
+#
+embeddingModel: "default"
 
 # --- vLLM (only active when inferenceBackend=vllm) ---
 vllm:
@@ -38,30 +88,10 @@ vllm:
     pullPolicy: IfNotPresent
   service:
     port: 8000
-  model: ""           # resolved from modelTier by _helpers.tpl if empty
+  model: ""           # resolved from modelTier + quantisation by _helpers.tpl if empty
   tensorParallelSize: 1
   maxModelLen: 32768
   gpuMemoryUtilization: "0.90"
-
-# --- Model Tier ---
-# Controls which model is deployed and how resources are allocated.
-# Options: "full", "balanced", "lightweight"
-#
-#   full        → Mistral Nemo (12B) — best quality, needs GPU + 12Gi RAM
-#   balanced    → Qwen2.5-Coder 7B  — solid quality, ~8Gi RAM
-#   lightweight → Phi-3.5 Mini (3.8B) — edge/low-resource, ~4Gi RAM
-#
-modelTier: "full"
-
-# --- Embedding Model ---
-# WARNING: Changing this after ingestion requires full re-ingestion.
-# Vector dimension is derived automatically by _helpers.tpl.
-#
-#   default     → nomic-embed-text (768-dim)
-#   lightweight → all-minilm (384-dim)
-#   rich        → mxbai-embed-large (1024-dim)
-#
-embeddingModel: "default"
 
 # --- Ollama ---
 ollama:
@@ -87,17 +117,17 @@ app:
     type: ClusterIP
     port: 8501
   env:
-    OLLAMA_HOST: ""       # auto-set by _helpers.tpl
-    VLLM_HOST: ""         # auto-set by _helpers.tpl when inferenceBackend=vllm
-    OLLAMA_MODEL: ""      # auto-set by _helpers.tpl from modelTier
-    MLFLOW_TRACKING_URI: ""  # auto-set by _helpers.tpl to in-cluster MLflow
+    OLLAMA_HOST: ""         # auto-set by _helpers.tpl
+    VLLM_HOST: ""           # auto-set by _helpers.tpl when inferenceBackend=vllm
+    OLLAMA_MODEL: ""        # auto-set by _helpers.tpl from modelTier + quantisation
+    MLFLOW_TRACKING_URI: "" # auto-set by _helpers.tpl to in-cluster MLflow
     LOG_LEVEL: "info"
 
 # --- Vector DB (ChromaDB) ---
 vectordb:
   image:
     repository: chromadb/chroma
-    tag: latest
+    tag: "0.6.3"
     pullPolicy: IfNotPresent
   service:
     port: 8000
@@ -105,6 +135,19 @@ vectordb:
     enabled: true
     size: 10Gi
     storageClass: ""
+  # HNSW index tuning — applied at collection creation time in vector_store.py.
+  # deploymentTarget=local overrides searchEf to 20 (faster, less accurate —
+  # acceptable for single-user dev). All other params respected as-is.
+  #
+  #   M              → bidirectional links per node; higher = better recall, more memory
+  #   constructionEf → candidate list size at build time; higher = better recall, slower build
+  #   searchEf       → candidate list size at query time; higher = better recall, slower query
+  #
+  hnsw:
+    space: "cosine"
+    M: 16
+    constructionEf: 100
+    searchEf: 50
 
 # --- MLflow tracking server ---
 mlflow:
