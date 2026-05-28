@@ -400,7 +400,7 @@ def tool_graph_traverse(
         elif query_type == "symbols":
             rows = gs.symbols_in_file(target)
             results = [
-                f"{r['kind']} `{r['name']}` (lines {r.get('start', '?')}–{r.get('end', '?')})"
+                f"{r['kind']} `{r['name']}` (lines {r.get('start', '?')}–{r.get('end_line', '?')})"
                 for r in rows
             ]
             label = f"Symbols defined in `{target}`"

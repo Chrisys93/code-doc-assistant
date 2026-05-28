@@ -145,7 +145,9 @@ class KuzuGraphStore:
     def _init_db(self) -> None:
         try:
             import kuzu
-            Path(self.graph_path).mkdir(parents=True, exist_ok=True)
+            # Kuzu creates the database directory itself — do NOT pre-create it.
+            # mkdir the parent only, so the path is reachable.
+            Path(self.graph_path).parent.mkdir(parents=True, exist_ok=True)
             self._db = kuzu.Database(self.graph_path)
             self._conn = kuzu.Connection(self._db)
             for stmt in SCHEMA_DDL.strip().split(";"):
@@ -166,12 +168,16 @@ class KuzuGraphStore:
         return self._conn is not None
 
     def reset(self) -> None:
-        """Drop all data and re-initialise schema. Called before re-ingestion."""
+        """Delete and recreate the graph. Kuzu stores as a file, not a directory."""
         import shutil
-        if Path(self.graph_path).exists():
-            shutil.rmtree(self.graph_path)
         self._db = None
         self._conn = None
+        path = Path(self.graph_path)
+        if path.exists():
+            if path.is_dir():
+                shutil.rmtree(self.graph_path)
+            else:
+                path.unlink()
         self._init_db()
         logger.info("Graph store reset")
 
@@ -347,13 +353,13 @@ class KuzuGraphStore:
         fns = self.query(
             "MATCH (f:File {path: $path})-[:DEFINES]->(fn:Function) "
             "RETURN fn.name AS name, fn.start_line AS start, "
-            "       fn.end_line AS end, 'function' AS kind",
+            "       fn.end_line AS end_line, 'function' AS kind",
             {"path": file_path},
         )
         cls = self.query(
             "MATCH (f:File {path: $path})-[:DEFINES_CLASS]->(c:Class) "
             "RETURN c.name AS name, c.start_line AS start, "
-            "       c.end_line AS end, 'class' AS kind",
+            "       c.end_line AS end_line, 'class' AS kind",
             {"path": file_path},
         )
         return sorted(fns + cls, key=lambda x: x.get("start", 0))

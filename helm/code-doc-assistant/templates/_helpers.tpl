@@ -206,9 +206,13 @@ limits:
 {{/*
 Resolve context-window and timeout config from modelTier.
 Minimal tier gets a tighter context window to reduce memory pressure.
+llamacpp backend overrides context to match llama-server's --ctx-size.
 */}}
 {{- define "code-doc-assistant.inferenceConfig" -}}
-{{- if eq .Values.modelTier "full" }}
+{{- if eq .Values.inferenceBackend "llamacpp" }}
+OLLAMA_NUM_CTX: "{{ .Values.llamacpp.contextSize | default 2048 }}"
+OLLAMA_TIMEOUT: "60"
+{{- else if eq .Values.modelTier "full" }}
 OLLAMA_NUM_CTX: "8192"
 OLLAMA_TIMEOUT: "120"
 {{- else if eq .Values.modelTier "balanced" }}
@@ -307,4 +311,12 @@ vLLM inference server internal hostname.
 */}}
 {{- define "code-doc-assistant.vllmHost" -}}
 http://{{ include "code-doc-assistant.fullname" . }}-vllm:{{ .Values.vllm.service.port }}
+{{- end -}}
+
+{{/*
+llama-server (llama.cpp) internal hostname.
+Only active when inferenceBackend=llamacpp.
+*/}}
+{{- define "code-doc-assistant.llamacppHost" -}}
+http://{{ include "code-doc-assistant.fullname" . }}-llamacpp:{{ .Values.llamacpp.service.port }}
 {{- end -}}

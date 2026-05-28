@@ -31,6 +31,13 @@ chromadb==0.6.3                  # pinned — matches helm chart + docker-compos
 # Install is optional — graph features degrade gracefully if absent.
 kuzu>=0.6.0
 
+# --- llama.cpp Python bindings (optional) ---
+# Only needed if running llama-server via llama-cpp-python directly
+# (rather than the ghcr.io/ggerganov/llama.cpp:server Docker image).
+# The Docker image approach (used in docker-compose_dev.yml) does NOT
+# require this package — llama-cpp-python is for direct Python embedding only.
+# llama-cpp-python>=0.3.0
+
 # --- MCP client ---
 # Required for MCP-backed tools (fs_read, github_*, slack_*).
 # Only used when MCP_*_ENABLED=true and is_mcp_capable() returns True.

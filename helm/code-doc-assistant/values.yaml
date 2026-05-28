@@ -35,8 +35,14 @@ maxContextTokens: 8000
 deploymentTarget: "local"
 
 # --- Inference Backend ---
-# "ollama" (default) — Ollama StatefulSet, CPU fallback available.
-# "vllm"             — vLLM Deployment, GPU required, OpenAI-compatible API.
+# "ollama"   (default) — Ollama StatefulSet, CPU fallback available.
+#                        Model management included. Best for full/balanced tiers.
+# "vllm"               — vLLM Deployment, GPU required, OpenAI-compatible API.
+#                        Best for high-throughput serving at scale.
+# "llamacpp"           — llama-server Deployment, CPU-native, OpenAI-compatible API.
+#                        Best for lightweight/minimal tiers on constrained machines.
+#                        Note: Ollama wraps llama.cpp for most models — use llamacpp
+#                        directly when running a specific GGUF with maximum control.
 #
 inferenceBackend: "ollama"
 
@@ -79,6 +85,24 @@ quantisation: "q4_K_M"
 #   rich        → mxbai-embed-large (1024-dim)
 #
 embeddingModel: "default"
+
+# --- llama.cpp / llama-server (only active when inferenceBackend=llamacpp) ---
+# llama-server exposes an OpenAI-compatible API identical to vLLM's.
+# Runs GGUF models CPU-natively (or with partial Metal/CUDA offload).
+# Recommended pairing: lightweight or minimal modelTier.
+llamacpp:
+  image:
+    repository: ghcr.io/ggerganov/llama.cpp
+    tag: server
+    pullPolicy: IfNotPresent
+  service:
+    port: 8081
+  # Path to the GGUF model file inside the container (mounted from llamacpp_models volume)
+  modelPath: "/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+  servedModelName: "qwen2.5-coder-3b-instruct-q4_k_m"
+  contextSize: 2048
+  threads: 4          # CPU threads for inference; set to physical core count
+  gpuLayers: 0        # layers to offload to GPU (0 = CPU-only)
 
 # --- vLLM (only active when inferenceBackend=vllm) ---
 vllm:

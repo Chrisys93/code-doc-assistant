@@ -268,9 +268,28 @@ The instinct was to layer tool use on top of the existing RAG pipeline. The refr
 
 **Decision: LangGraph `StateGraph` with nine nodes and two configurable interrupt points.**
 
-```
-START → tool_selection →[HITL-1]→ tool_execution → supervisor ⟲
-      → context_assembly → generation → output_review →[HITL-2]→ END
+```mermaid
+flowchart TD
+    START(["START"])
+    TS["tool_selection"]
+    HITL1["hitl_checkpoint\n[HITL-1]"]
+    TE["tool_execution"]
+    SUP["supervisor"]
+    CA["context_assembly"]
+    GEN["generation"]
+    OR["output_review\n[HITL-2]"]
+    END_(["END"])
+
+    START --> TS
+    TS --> HITL1
+    HITL1 --> TE
+    TE --> SUP
+    SUP -->|retry| TE
+    SUP --> CA
+    CA --> GEN
+    GEN --> OR
+    OR -->|regenerate| TS
+    OR --> END_
 ```
 
 `[HITL-1]` = `interrupt_before` on `hitl_checkpoint` when `HITL_ENABLED=true`
@@ -305,31 +324,68 @@ All shell tools validate paths against `REPO_PATH` and use an allowlisted flag s
 
 ---
 
-## Phase 10: vLLM Integration
+## Phase 10: Inference Backend Factory
 
-**Decision: `INFERENCE_BACKEND` env var switches between Ollama and vLLM at the `_get_llm()` factory — no other code changes required.**
+**Decision: `INFERENCE_BACKEND` env var switches between Ollama, vLLM, and llama-server at the `_get_llm()` factory — no other code changes required.**
 
-vLLM exposes an OpenAI-compatible API. `ChatOpenAI` from `langchain-openai`, pointed at `VLLM_HOST/v1`, is functionally identical to any other LangChain chat model from the perspective of every graph node. The `api_key` field is set to `"not-required"` — vLLM ignores it entirely. All nine graph nodes call `_get_llm()` and are backend-agnostic.
+```mermaid
+flowchart LR
+    BACKEND["INFERENCE_BACKEND\nenv var"]
 
-`VLLM_MODEL` falls back to `OLLAMA_MODEL`, so `MODEL_TIER` continues to work as the single high-level control for both backends without additional configuration.
+    BACKEND -->|ollama| OL["ChatOllama\n→ Ollama REST API\nmodel management\nCPU fallback"]
+    BACKEND -->|vllm| VL["ChatOpenAI\n→ VLLM_HOST/v1\nOpenAI-compatible\nGPU / PagedAttention"]
+    BACKEND -->|llamacpp| LC["ChatOpenAI\n→ LLAMACPP_HOST/v1\nOpenAI-compatible\nCPU-native GGUF"]
 
-The practical distinction between backends: Ollama is for developer convenience — auto-pull, CPU fallback, single-command setup. vLLM is for team deployments under concurrent load: continuous batching and PagedAttention make it significantly more efficient when multiple developers are using the tool simultaneously. The switch costs one environment variable.
+    OL & VL & LC --> NODES["All nine graph nodes\n(backend-agnostic)"]
+```
 
-**Evolution of thinking — from "vLLM as a future note" to wired-in backend:**
+All nine graph nodes call `_get_llm()` and are backend-agnostic. The `api_key` field is set to `"not-required"` for vLLM and llama-server — both ignore it entirely.
 
-The initial ARCHITECTURE.md mentioned vLLM as a "what I'd do with more time" item and `query_engine.py` as the place to add it. In `dev`, it became clear that the right abstraction was the `_get_llm()` factory, not the query engine — the factory is the single point where a LangChain model is constructed, so backend-switching belongs there. The `langchain-openai` package provides `ChatOpenAI`, which handles the OpenAI-compatible API surface. The result is that vLLM is now a first-class deployment option rather than a future consideration, and swapping backends requires no application code changes.
+`MODEL_TIER` continues to work as the single high-level control across all backends. `LLAMACPP_MODEL` defaults to the minimal tier model; `VLLM_MODEL` falls back to `OLLAMA_MODEL`.
+
+**Backend affinity by tier:**
+- `full` / `balanced` → Ollama or vLLM (GPU recommended)
+- `lightweight` / `minimal` → Ollama or llama-server (CPU-native GGUF; llama-server skips Ollama's model management overhead, useful in CI and constrained environments)
+
+**`max_tokens` is conservative for llama-server** (2048 vs 4096 for vLLM): llama-server's context size is set at startup via `--ctx-size` and cannot be exceeded at the API level — a conservative default prevents silent truncation.
+
+**Evolution of thinking — from "vLLM as a future note" to three wired-in backends:**
+
+The initial ARCHITECTURE.md mentioned vLLM as a "what I'd do with more time" item. In `dev`, the right abstraction became clear: the `_get_llm()` factory is the single point where a LangChain model is constructed, so backend-switching belongs there. llama.cpp/llama-server was added after recognising that Ollama wraps llama.cpp internally for most models — the efficiency difference is small for `full`/`balanced` tiers, but meaningful for `minimal` on CPU-only machines where skipping the Ollama daemon layer reduces startup overhead and memory footprint.
 
 ---
 
-## Phase 11: MLflow — Both Branches
+## Phase 11: MLflow — System-Level Observability
 
-**Decision: MLflow available in both branches, with different defaults.**
+**Decision: MLflow is a system-level observability layer, not associated with any inference backend.**
 
-`dev`: MLflow is always-on in `docker-compose.dev.yml`. Every query creates a run logging: inference backend, resolved model name, HITL settings, output review mode, retrieval confidence metrics, quality gate scores, user satisfaction rating, generation latency, tool calls executed. The Session tab in the Streamlit UI links directly to the last run's MLflow page.
+MLflow logs the behaviour of the system as a whole — regardless of which inference backend is active (Ollama, vLLM, or llama-server), which model tier is deployed, or which tools were called. The inference backend is one *attribute* logged per run, not a dependency of the logging itself.
 
-`master`: MLflow is opt-in via `--profile observability`. A plain `docker compose up` is entirely unchanged for existing users. Adding it to `master` rather than keeping it `dev`-only means the research repo's master branch can inherit it without needing to introduce a new service — it's already present in the compose file, gated behind a profile flag. The app handles a missing `MLFLOW_TRACKING_URI` gracefully throughout (all MLflow calls are in `try/except`).
+```mermaid
+flowchart TD
+    subgraph SYSTEM["System (any tier, any backend)"]
+        AGENT["Agent run\n(LangGraph)"]
+        INGEST["Ingestion run\n(LlamaIndex + Kuzu)"]
+    end
 
-The MLflow-vs-W&B decision: W&B requires a licence for team use at scale. MLflow paired with Argo Workflows (Argo for orchestration, MLflow for tracking) covers the same functional ground with no licence cost and cleaner architectural separation of concerns. The combination also makes the system more composable for the research repo: MLflow run IDs become traceable links between code versions, embedding indexes, and the preference data accumulated from HITL interactions.
+    MLFLOW[("MLflow\nTracking Server\n:5000")]
+
+    AGENT -->|"inference_backend · model_name\nHITL decisions · tool_calls\nretrieval_confidence · quality_gate_scores\nuser_satisfaction · latency · run_id"| MLFLOW
+
+    INGEST -->|"commit_sha · embedding_model\nchunk_count · collection_name\ngraph_build_status · run_id"| MLFLOW
+```
+
+`dev`: MLflow is always-on in `docker-compose_dev.yml`. Every query creates a run. The Trace tab in the Streamlit UI links directly to the last run's MLflow page.
+
+`master`: MLflow is opt-in via `--profile observability`. A plain `docker compose up` is unchanged for existing users. The app handles a missing `MLFLOW_TRACKING_URI` gracefully throughout (all MLflow calls are in `try/except`).
+
+**What each run logs:**
+
+Agent runs log: inference backend, resolved model name, HITL settings, output review mode, retrieval confidence metrics, quality gate scores, user satisfaction rating (1–5), generation latency, tool calls executed, supervisor adjustment audit trail.
+
+Ingestion runs log: commit SHA, embedding model, chunk count, collection name, graph build status (dependency graph + co-change graph). This makes MLflow run IDs traceable links between code versions, embedding indexes, and the preference data accumulated from HITL — directly relevant for the DPO training pipeline in the `orchestrated` research branch.
+
+**MLflow vs W&B**: W&B requires a licence for team use at scale. MLflow paired with Argo Workflows (Argo for orchestration, MLflow for tracking) covers the same functional ground with no licence cost and cleaner architectural separation of concerns.
 
 ---
 
@@ -337,14 +393,25 @@ The MLflow-vs-W&B decision: W&B requires a licence for team use at scale. MLflow
 
 **Decision: Argo `WorkflowTemplate` replaces the `ollama-bootstrap` one-shot container with a proper DAG.**
 
-```
-clone-or-mount → discover-files → chunk-code ─┐
-                                  chunk-text  ─┴→ embed-and-store → log-to-mlflow
+```mermaid
+flowchart LR
+    CLONE["clone-or-mount"]
+    DISCOVER["discover-files"]
+    CHUNK_CODE["chunk-code"]
+    CHUNK_TEXT["chunk-text"]
+    EMBED["embed-and-store"]
+    LOG["log-to-mlflow"]
+
+    CLONE --> DISCOVER
+    DISCOVER --> CHUNK_CODE & CHUNK_TEXT
+    CHUNK_CODE --> EMBED
+    CHUNK_TEXT --> EMBED
+    EMBED --> LOG
 ```
 
 `chunk-code` and `chunk-text` run in parallel (different file type sets). A `CronWorkflow` (suspended by default, enabled in production) handles nightly re-ingestion. This moves ingestion from "a thing that happens on container startup" to "a scheduled, observable, retryable pipeline with a logged artefact in MLflow."
 
-The MLflow step at the end of every ingestion run creates a traceable link between a specific code commit and the embedding index built from it — directly relevant for the research repo's cross-session preference work, where it matters which version of the codebase a preference signal was generated against.
+The `log-to-mlflow` step records the commit SHA, embedding model, chunk count, and graph build status — making each ingestion run a traceable link between a specific code version and the embedding index built from it.
 
 ---
 
@@ -700,4 +767,92 @@ Your intuition about locality-sensitive domains is the right framing. For querie
 The path from code dependency graph → knowledge graph is an enrichment of the same structure: starting with structurally-derived edges (CALLS, IMPORTS), adding semantically-derived edges (SIMILAR_PURPOSE, CONCEPTUALLY_RELATED), then adding provenance edges (MOTIVATED_BY, REPLACED_BY). As the graph becomes richer, it enables increasingly generic and increasingly specialised queries simultaneously — the knowledge graph is the same structure, just with more edge types and more heterogeneous nodes.
 
 This is explicitly `orchestrated` branch territory in the research repo: graph-aware retrieval strategy adaptation, where the supervisor doesn't just adjust retrieval parameters but reasons about which part of the graph is relevant to a query before retrieval begins.
+
+
+---
+
+## Phase 17: llama.cpp — Third Inference Backend
+
+### Why a third backend
+
+Ollama wraps llama.cpp for most models — so in practice, the CPU efficiency difference between Ollama and llama.cpp directly is smaller than it appears for most tiers. The distinction matters specifically for `lightweight` and `minimal` tiers on constrained machines where:
+
+- You want to run a specific GGUF file without Ollama's model management layer
+- You need maximum control over context size, thread count, and GPU layer offload
+- You are running in a CI pipeline or very constrained environment where even the Ollama daemon adds overhead
+
+`llama-server` (llama.cpp's HTTP server mode) exposes an OpenAI-compatible `/v1/chat/completions` API identical to vLLM's. This means the `llamacpp` backend reuses `ChatOpenAI` pointed at `LLAMACPP_HOST` — no new LangChain client, no new interface, just a different endpoint.
+
+### Backend decision tree
+
+```
+GPU available, serving multiple users  → vllm
+CPU-only or constrained, need control  → llamacpp
+Want model management / easy pulls     → ollama (default)
+```
+
+### Tier affinity
+
+| Backend | Recommended tiers | Notes |
+|---|---|---|
+| ollama | full, balanced, lightweight, minimal | Default; model management included |
+| vllm | full, balanced | GPU required; high-throughput |
+| llamacpp | lightweight, minimal | CPU-native GGUF; lowest overhead |
+
+`lightweight` and `minimal` suppress the quantisation suffix (already Q4 by default), so llama-server receives e.g. `phi3.5` or `qwen2.5-coder:3b-instruct` as the served model name.
+
+### Models must be downloaded manually
+
+Unlike Ollama, llama-server does not pull models. GGUF files must be placed in `./models/` before starting the `llamacpp` profile. The `docker-compose_dev.yml` service definition includes a download example in comments.
+
+### max_tokens is conservative for llamacpp
+
+`_get_llm()` sets `max_tokens=2048` for the llamacpp backend (vs 4096 for vllm). llama-server's context size is set at startup via `--ctx-size` and cannot be exceeded at the API level — a conservative default prevents silent truncation.
+
+---
+
+## Phase 18: Testing Infrastructure
+
+### Scope
+
+`test_pipeline.py` is a single-file, no-external-services test suite covering the full dev branch stack. It runs entirely in-process — ChromaDB embedded, Kuzu embedded, LLM calls mocked via importlib reload, local trigram embeddings substituted for Ollama embeddings.
+
+### Test classes and what they cover
+
+| Class | Coverage |
+|---|---|
+| `TestConfig` | All tier/quant/backend combinations, HNSW params, deployment target, MCP flags |
+| `TestDiscovery` | File discovery, chunking, metadata, skip-dir behaviour |
+| `TestVectorStore` | HNSW metadata applied correctly for local vs cluster; in-process roundtrip |
+| `TestGraphStore` | Kuzu init, upsert, import/call/co-change edges, raw Cypher, reset |
+| `TestToolRegistry` | Local tools present, MCP registry present, MCP capability gating per tier, run_tool dispatch |
+| `TestAgentState` | Dataclass integrity, SessionPreferences.update(), running average, format propagation |
+| `TestInferenceBackend` | _get_llm() returns correct type per backend, host/port separation, max_tokens |
+| `TestRetrievalQuality` | End-to-end embed→store→retrieve, per-file hit assertions, regression guard |
+| `TestMinimalDeployment` | All knobs consistent for minimal + llamacpp + local: model tag, chunking, HNSW, registry, backend |
+
+### Bugs found during test authoring
+
+Three real bugs were caught by the tests that would have caused silent failures in production:
+
+1. **Kuzu `mkdir` before init** — `Path.mkdir()` pre-creating the graph path caused Kuzu to fail with "cannot be a directory". Fixed: only `mkdir` the parent; Kuzu creates the database path itself.
+2. **Kuzu `reset()` using `shutil.rmtree`** — Kuzu stores the database as a file, not a directory. `rmtree` raised `NotADirectoryError`. Fixed: detect file vs directory and use `path.unlink()` accordingly.
+3. **`end` is a reserved word in Kuzu Cypher** — `RETURN fn.end_line AS end` caused a parser exception. Fixed: renamed to `end_line` throughout `graph_store.py` and `tools.py`.
+4. **`ingest.py` top-level Ollama import** — `from llama_index.embeddings.ollama import OllamaEmbedding` at module level prevented import in test environments without the llama-index extras package. Fixed: moved to lazy import inside `build_index()` and `load_existing_index()`.
+
+### Running the tests
+
+```bash
+# Full suite (no external services required)
+python test_pipeline.py
+
+# Specific class
+python -m pytest test_pipeline.py::TestMinimalDeployment -v
+
+# Smoke test (fast summary, no unittest verbosity)
+python test_pipeline.py smoke
+
+# Test a specific deployment profile
+MODEL_TIER=minimal INFERENCE_BACKEND=llamacpp DEPLOYMENT_TARGET=local python test_pipeline.py
+```
 

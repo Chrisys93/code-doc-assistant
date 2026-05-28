@@ -79,15 +79,24 @@ CHROMA_HOST = os.environ.get("CHROMA_HOST", "http://localhost:8000")
 MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000")
 HITL_ENABLED = os.environ.get("HITL_ENABLED", "true").lower() == "true"
 
-# Inference backend: "ollama" (default) | "vllm"
-# vLLM exposes an OpenAI-compatible API, so we use ChatOpenAI pointed at VLLM_HOST.
-# Switching backends requires no code changes — only env vars change.
+# Inference backend: "ollama" (default) | "vllm" | "llamacpp"
+#
+# ollama   → ChatOllama → Ollama REST API. Default; model management included.
+#            Best for: full/balanced tiers, ease of use.
+# vllm     → ChatOpenAI → vLLM OpenAI-compatible API. GPU required.
+#            Best for: high-throughput serving at scale.
+# llamacpp → ChatOpenAI → llama-server OpenAI-compatible API. CPU-native.
+#            Best for: lightweight/minimal tiers on constrained machines.
+#            llama-server exposes the same /v1/chat/completions API as vLLM;
+#            we reuse ChatOpenAI pointed at LLAMACPP_HOST.
+#
 INFERENCE_BACKEND = os.environ.get("INFERENCE_BACKEND", "ollama").lower()
 VLLM_HOST = os.environ.get("VLLM_HOST", "http://localhost:8080")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", os.environ.get("OLLAMA_MODEL", "mistral-nemo"))
-# vLLM serves models by their HuggingFace name, but accepts any string as model ID
-# when --served-model-name is set. We fall back to OLLAMA_MODEL so a single
-# MODEL_TIER env var works for both backends without extra config.
+LLAMACPP_HOST = os.environ.get("LLAMACPP_HOST", "http://localhost:8081")
+# LLAMACPP_MODEL is the --served-model-name passed to llama-server,
+# or GGUF filename stem if no alias is set. Defaults to minimal tier model.
+LLAMACPP_MODEL = os.environ.get("LLAMACPP_MODEL", "qwen2.5-coder-3b-instruct-q4_k_m")
 
 # Output review mode — controls post-generation quality gate behaviour.
 # "human"      → HITL-2: interrupt and wait for human rating + decision
@@ -114,22 +123,35 @@ def _get_llm(temperature: float = 0.1):
     """
     Return a LangChain chat model pointed at the configured inference backend.
 
-    Ollama:  ChatOllama → talks to the Ollama REST API directly.
-    vLLM:    ChatOpenAI → talks to vLLM's OpenAI-compatible endpoint.
-             No API key needed; vLLM ignores the key field entirely.
-             The model name must match --served-model-name in the vLLM command,
-             or the HuggingFace model ID if no alias is set.
+    ollama   → ChatOllama. Talks to the Ollama REST API directly.
+    vllm     → ChatOpenAI pointed at vLLM's OpenAI-compatible /v1 endpoint.
+    llamacpp → ChatOpenAI pointed at llama-server's OpenAI-compatible /v1 endpoint.
+               llama-server is started separately (see docker-compose_dev.yml --profile
+               llamacpp). No API key required for either vLLM or llama-server.
 
-    Both return the same LangChain BaseLanguageModel interface, so all nodes
-    are backend-agnostic.
+    All three return the same LangChain BaseLanguageModel interface —
+    all nodes are backend-agnostic.
+
+    Tier affinity (not enforced, but documented):
+      llamacpp → lightweight / minimal  (CPU-native GGUF, lowest memory)
+      ollama   → any tier               (model management included)
+      vllm     → full / balanced        (GPU, high throughput)
     """
     if INFERENCE_BACKEND == "vllm":
         return ChatOpenAI(
             base_url=f"{VLLM_HOST}/v1",
-            api_key="not-required",          # vLLM ignores this
+            api_key="not-required",
             model=VLLM_MODEL,
             temperature=temperature,
             max_tokens=4096,
+        )
+    if INFERENCE_BACKEND == "llamacpp":
+        return ChatOpenAI(
+            base_url=f"{LLAMACPP_HOST}/v1",
+            api_key="not-required",
+            model=LLAMACPP_MODEL,
+            temperature=temperature,
+            max_tokens=2048,  # conservative default; llama-server context is GGUF-defined
         )
     # Default: Ollama
     return ChatOllama(
@@ -899,7 +921,11 @@ def run_agent(query: str, repo_path: str, thread_id: str = "default",
         mlflow.log_param("query", query)
         mlflow.log_param("repo_path", repo_path)
         mlflow.log_param("inference_backend", INFERENCE_BACKEND)
-        mlflow.log_param("model", VLLM_MODEL if INFERENCE_BACKEND == "vllm" else OLLAMA_MODEL)
+        mlflow.log_param("model", (
+            VLLM_MODEL if INFERENCE_BACKEND == "vllm"
+            else LLAMACPP_MODEL if INFERENCE_BACKEND == "llamacpp"
+            else OLLAMA_MODEL
+        ))
         mlflow.log_param("hitl_enabled", HITL_ENABLED)
         mlflow.log_param("output_review_mode", OUTPUT_REVIEW_MODE)
 

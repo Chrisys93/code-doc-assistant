@@ -1,0 +1,265 @@
+# ============================================================
+# Code Documentation Assistant — Docker Compose (dev branch)
+# ============================================================
+# Changes from main docker-compose.yml:
+#   - MLflow tracking server (always-on, not behind profile)
+#   - vLLM service (GPU required, behind 'vllm' profile)
+#   - HITL_ENABLED, OUTPUT_REVIEW_MODE, QUALITY_GATE_THRESHOLD
+#   - INFERENCE_BACKEND: "ollama" (default) | "vllm"
+#   - CONFIDENCE_THRESHOLD, MAX_RETRIEVAL_ATTEMPTS configurable
+#   - src/ bind-mount for live-reload during development
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up --build
+#   HITL_ENABLED=false docker compose -f docker-compose.dev.yml up
+#   OUTPUT_REVIEW_MODE=supervisor docker compose -f docker-compose.dev.yml up
+#   INFERENCE_BACKEND=vllm docker compose -f docker-compose.dev.yml --profile vllm up
+#   MODEL_TIER=lightweight docker compose -f docker-compose.dev.yml up
+#
+# Access:
+#   Streamlit UI:  http://localhost:8501
+#   MLflow UI:     http://localhost:5000
+# ============================================================
+
+services:
+
+  # --- Ollama (default inference backend) ---
+  ollama:
+    image: ollama/ollama:latest
+    container_name: code-doc-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    # GPU: docker compose -f docker-compose.dev.yml -f docker-compose.gpu.yml up
+
+  # --- Model bootstrap ---
+  ollama-bootstrap:
+    image: ollama/ollama:latest
+    container_name: code-doc-bootstrap
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=ollama:11434
+      - MODEL_TIER=${MODEL_TIER:-full}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+    entrypoint: >
+      bash -c '
+        QUANT="${QUANTISATION:-q4_K_M}"
+        case "$${MODEL_TIER}" in
+          full)        BASE="mistral-nemo:12b-instruct" ;;
+          balanced)    BASE="deepseek-coder-v2:16b-lite-instruct" ;;
+          lightweight) BASE="phi3.5" ; QUANT="" ;;
+          minimal)     BASE="qwen2.5-coder:3b-instruct" ; QUANT="" ;;
+          *)           BASE="mistral-nemo:12b-instruct" ;;
+        esac
+        if [ -n "$${QUANT}" ]; then
+          MODEL="${BASE}-${QUANT}"
+        else
+          MODEL="$${BASE}"
+        fi
+        echo "Pulling LLM: $${MODEL} (tier=$${MODEL_TIER}, quant=$${QUANT:-default})"
+        ollama pull $${MODEL}
+        echo "Pulling embedding model: $${EMBEDDING_MODEL}"
+        ollama pull $${EMBEDDING_MODEL}
+        echo "Bootstrap complete."
+      '
+    restart: "no"
+
+  # --- vLLM (alternative inference backend, GPU required) ---
+  # Enable with: INFERENCE_BACKEND=vllm docker compose -f docker-compose.dev.yml --profile vllm up
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: code-doc-vllm
+    profiles: ["vllm"]
+    ports:
+      - "8080:8000"
+    volumes:
+      - vllm_model_cache:/root/.cache/huggingface
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command:
+      - "--model"
+      - "${VLLM_MODEL:-mistralai/Mistral-7B-Instruct-v0.3}"
+      - "--tensor-parallel-size"
+      - "${VLLM_TP:-1}"
+      - "--max-model-len"
+      - "32768"
+      - "--gpu-memory-utilization"
+      - "0.90"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # --- llama-server / llama.cpp (CPU-native alternative, lightweight/minimal tiers) ---
+  # Enable with: INFERENCE_BACKEND=llamacpp docker compose -f docker-compose_dev.yml --profile llamacpp up
+  # Models must be downloaded as GGUF files into ./models/ before starting.
+  # Recommended pairings: lightweight → phi3.5 Q4, minimal → qwen2.5-coder:3b Q4
+  #
+  # Download model example:
+  #   mkdir -p models
+  #   curl -L -o models/qwen2.5-coder-3b-instruct-q4_k_m.gguf \
+  #     https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf
+  llamacpp:
+    image: ghcr.io/ggerganov/llama.cpp:server
+    container_name: code-doc-llamacpp
+    profiles: ["llamacpp"]
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./models:/models:ro
+    command:
+      - "--model"
+      - "${LLAMACPP_MODEL_PATH:-/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf}"
+      - "--served-model-name"
+      - "${LLAMACPP_MODEL:-qwen2.5-coder-3b-instruct-q4_k_m}"
+      - "--ctx-size"
+      - "${LLAMACPP_CTX_SIZE:-2048}"
+      - "--threads"
+      - "${LLAMACPP_THREADS:-4}"
+      - "--n-gpu-layers"
+      - "${LLAMACPP_GPU_LAYERS:-0}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # --- ChromaDB ---
+  chromadb:
+    image: chromadb/chroma:0.6.3
+    container_name: code-doc-chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - ANONYMIZED_TELEMETRY=false
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/heartbeat')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --- MLflow tracking server (always-on in dev) ---
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: code-doc-mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    command:
+      - mlflow
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      - --backend-store-uri=sqlite:////mlflow/mlflow.db
+      - --default-artifact-root=/mlflow/artifacts
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --- Application (dev branch — LangGraph agent + Streamlit) ---
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: code-doc-app
+    ports:
+      - "8501:8501"
+    depends_on:
+      chromadb:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    environment:
+      # Inference backend
+      - INFERENCE_BACKEND=${INFERENCE_BACKEND:-ollama}
+      - OLLAMA_HOST=http://ollama:11434
+      - VLLM_HOST=http://vllm:8000
+      - LLAMACPP_HOST=http://llamacpp:8080
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral-nemo:12b-instruct-q4_K_M}
+      - LLAMACPP_MODEL=${LLAMACPP_MODEL:-qwen2.5-coder-3b-instruct-q4_k_m}
+
+      # Vector DB
+      - CHROMA_HOST=http://chromadb:8000
+
+      # MLflow
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+
+      # Model / embedding / quantisation
+      - MODEL_TIER=${MODEL_TIER:-full}
+      - QUANTISATION=${QUANTISATION:-q4_K_M}
+      - DEPLOYMENT_TARGET=${DEPLOYMENT_TARGET:-local}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+
+      # Agent behaviour
+      - HITL_ENABLED=${HITL_ENABLED:-true}
+      - OUTPUT_REVIEW_MODE=${OUTPUT_REVIEW_MODE:-human}
+      - QUALITY_GATE_THRESHOLD=${QUALITY_GATE_THRESHOLD:-6.0}
+      - CONFIDENCE_THRESHOLD=${CONFIDENCE_THRESHOLD:-0.45}
+      - MAX_RETRIEVAL_ATTEMPTS=${MAX_RETRIEVAL_ATTEMPTS:-3}
+      - MAX_GENERATION_ATTEMPTS=${MAX_GENERATION_ATTEMPTS:-3}
+      - MAX_CONTEXT_TOKENS=${MAX_CONTEXT_TOKENS:-8000}
+
+      # Graph DB (Kuzu)
+      - GRAPH_ENABLED=${GRAPH_ENABLED:-true}
+      - GRAPH_PATH=/data/graph
+      - GRAPH_CO_CHANGE_COMMITS=${GRAPH_CO_CHANGE_COMMITS:-100}
+
+      # MCP servers (all opt-in, disabled by default)
+      - MCP_FILESYSTEM_ENABLED=${MCP_FILESYSTEM_ENABLED:-false}
+      - MCP_FILESYSTEM_URL=${MCP_FILESYSTEM_URL:-http://localhost:3000}
+      - MCP_GITHUB_ENABLED=${MCP_GITHUB_ENABLED:-false}
+      - MCP_GITHUB_URL=${MCP_GITHUB_URL:-http://localhost:3001}
+      - MCP_SLACK_ENABLED=${MCP_SLACK_ENABLED:-false}
+      - MCP_SLACK_URL=${MCP_SLACK_URL:-http://localhost:3002}
+
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      - ${REPO_PATH:-./repos}:/data/repos:ro
+      - graph_data:/data/graph
+      - ./src:/app/src   # live-reload during development
+
+volumes:
+  ollama_data:
+    driver: local
+  vllm_model_cache:
+    driver: local
+  chroma_data:
+    driver: local
+  mlflow_data:
+    driver: local
+  graph_data:
+    driver: local

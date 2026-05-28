@@ -22,8 +22,6 @@ from typing import Optional
 from git import Repo as GitRepo
 from llama_index.core import Document, VectorStoreIndex, StorageContext
 from llama_index.core.node_parser import CodeSplitter, SentenceSplitter
-from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.llms.ollama import Ollama
 
 from config import (
     OLLAMA_HOST,
@@ -218,6 +216,7 @@ def build_index(
     vector_store_impl: ChromaVectorStoreImpl,
 ) -> VectorStoreIndex:
     """Embed chunks and store in the vector database."""
+    from llama_index.embeddings.ollama import OllamaEmbedding
     embed_model = OllamaEmbedding(
         model_name=EMBEDDING_MODEL,
         base_url=OLLAMA_HOST,
@@ -238,6 +237,7 @@ def build_index(
 
 def load_existing_index(vector_store_impl: ChromaVectorStoreImpl) -> VectorStoreIndex:
     """Load an existing index from the vector store (no re-ingestion)."""
+    from llama_index.embeddings.ollama import OllamaEmbedding
     embed_model = OllamaEmbedding(
         model_name=EMBEDDING_MODEL,
         base_url=OLLAMA_HOST,
