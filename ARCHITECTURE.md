@@ -62,6 +62,18 @@ The Helm chart also surfaced the composability patterns (the `_helpers.tpl` tier
 
 **Decision: tiered model strategy — the system is model-agnostic, model name is a configuration value.**
 
+A single `modelTier` value cascades through the entire system:
+
+```mermaid
+flowchart LR
+    MT["modelTier=balanced"] --> M["deepseek-coder-v2:16b-lite-instruct"]
+    Q["quantisation=q4_K_M"] --> TAG["final tag:\ndeepseek-coder-v2:16b-lite-instruct-q4_K_M"]
+    M --> TAG
+    TAG --> RES["resource limits\nCPU/GPU allocation"]
+    MT --> CTX["ctx 8192\ntimeout 120s"]
+    MT --> CHUNK["AST chunking"]
+```
+
 **Task framing**: this is a *code comprehension + explanation* task, not code generation. The model must read retrieved code chunks, understand what they do, reason about relationships (dependencies, API endpoints, architecture), and explain in natural language. Reasoning capability — following multi-step logic across files — scales with parameter count and is the key differentiator between tiers.
 
 **Models evaluated**:
@@ -75,11 +87,14 @@ The Helm chart also surfaced the composability patterns (the `_helpers.tpl` tier
 
 *CodeLlama 7B was evaluated and excluded — Qwen2.5-Coder 7B supersedes it on modern benchmarks.*
 
-**Tiered defaults**:
+**Tiered defaults** (matches `config.py`'s `_MODEL_TIER_BASE`):
 
-1. **Full** — Mistral Nemo (12B). Best balance of explanation quality and code understanding. For polyglot codebases, DeepSeek-Coder V2 Lite is the recommended swap — recent research on MoE architectures confirms they're particularly effective for multi-language tasks, treating programming language diversity analogously to natural language multilingualism ([Wang et al., 2025](https://arxiv.org/abs/2508.19268)).
-2. **Balanced** — Qwen2.5-Coder 7B. Best-in-class at 7B. Right choice for ~8GB VRAM.
+1. **Full** — Mistral Nemo (12B). Best balance of explanation quality and code understanding.
+2. **Balanced** — DeepSeek-Coder V2 Lite (16B, MoE). Updated from the originally-evaluated Qwen2.5-Coder 7B — recent research on MoE architectures confirms they're particularly effective for multi-language tasks, treating programming language diversity analogously to natural language multilingualism ([Wang et al., 2025](https://arxiv.org/abs/2508.19268)).
 3. **Lightweight** — Phi-3.5 Mini (3.8B). Edge, CPU-only, or resource-constrained deployments. Fine-tuning candidate.
+4. **Minimal** — Qwen2.5-Coder 3B. Tightest memory footprint; CI pipelines and very constrained machines.
+
+*Note: Qwen2.5-Coder 7B (evaluated above) was the original `balanced`-tier candidate before the DeepSeek V2 Lite swap; it does not appear in the current tier mapping. The 3B Qwen2.5-Coder variant serves `minimal` instead.*
 
 **Hardware reality check**: frontier models reach trillions of parameters — three orders of magnitude above these. But without a multi-GPU system, models above ~16B aren't practical to serve. These tiers reflect models genuinely usable on realistic hardware.
 
@@ -127,6 +142,20 @@ An important distinction emerged during evaluation: **FAISS is a search index li
 For a code documentation assistant, **metadata filtering matters** — filtering by file type, directory, or language when searching. ChromaDB provides this out of the box. FAISS would require building all of that plumbing manually, or pairing it with a separate database for persistence and metadata.
 
 The abstraction layer preserves the ability to swap in FAISS+LSH or Qdrant later without changing application code. Pragmatic in implementation, extensible in design.
+
+On `dev`, this vector store is one of two retrieval mechanisms, used for semantic/approximate queries; Kuzu (Phase 16) handles structural/exact queries:
+
+```mermaid
+flowchart LR
+    subgraph RETRIEVAL["Retrieval"]
+        VS["Vector Search\nChromaDB\nsemantic / approximate"]
+        GT["Graph Traverse\nKuzu\nstructural / exact"]
+    end
+
+    Q1["'How does X work?'"] --> VS
+    Q2["'What calls X?'"] --> GT
+    Q3["'What changed with X?'"] --> GT
+```
 
 **Evolution of thinking — FAISS, LSH, and knowing when to stop:**
 

@@ -9,7 +9,7 @@
 | Branch | Pipeline | Status |
 |--------|----------|--------|
 | `master` | LlamaIndex RAG — simple, reviewer-friendly | Stable |
-| `dev` | LangGraph agent — HITL, multi-tool, graph DB, MCP | Active development |
+| `dev` | LangGraph agent — HITL, multi-tool, multi-repo (per-repo collections, fair-merge retrieval), graph DB, MCP | Active development |
 
 ---
 
@@ -40,7 +40,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    UI["Streamlit UI\n(Query · Ingest · Trace tabs)"]
+    UI["Streamlit UI\n(Chat · Pipeline · Session tabs)"]
     AGENT["LangGraph Agent"]
 
     subgraph AGENT["LangGraph Agent"]
@@ -94,6 +94,8 @@ flowchart TD
 
 **MLflow** is a system-level observability layer — it logs every agent run regardless of which inference backend is active, which tools were called, how many retrieval attempts the supervisor made, what HITL decisions were recorded, and what quality gate scores were produced. It is not associated with any particular inference server.
 
+**Multi-repo retrieval.** `TE <-->|vector search| CHROMA` above is per-repo, not global: each repo (GitHub URL or local path) is embedded into its own ChromaDB collection — one embedding model, many collections, so repos share a vector space but stay isolated at retrieval time. A deterministic gate (`repo_index.py`) ensures every repo entered is indexed before a query runs (idempotent — already-indexed repos are skipped in ~milliseconds). When a query spans multiple repos, `vector_search` merges results across their collections with **fair per-repo representation**: chunks are interleaved by within-collection rank rather than pooled by raw score, so a larger or more semantically "central" repo can't crowd a smaller one out of the context window. See [Multi-Repo Retrieval](#multi-repo-retrieval) below.
+
 ---
 
 ## Quick Setup
@@ -134,17 +136,39 @@ Open `http://localhost:8501`. On first start, `ollama-bootstrap` pulls the model
 
 ### `dev` branch — Docker Compose
 
-The dev compose file is standalone (not an override). It adds MLflow tracking (always-on) and exposes `vllm` and `llamacpp` as optional profiles.
+The dev overlay (`docker-compose.dev.yml`) layers on the base compose file — same pattern as the GPU overlay — adding MLflow tracking and live `./src` reload. It does not redeclare `ollama`/`chromadb`/`app` from scratch.
+
+MLflow sits behind the `observability` profile in the base file (so a bare `docker compose up` stays lightweight by default). The dev overlay's `app` service depends on `mlflow`, so the profile must be active — set it once in `.env` and forget it:
+
+```bash
+echo "COMPOSE_PROFILES=observability" >> .env
+```
 
 #### Default (Ollama, full tier, q4_K_M)
 
 ```bash
 git checkout dev
-docker compose -f docker-compose_dev.yml up --build
+
+# GPU:
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml -f docker-compose.dev.yml up --build
+# CPU:
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+# or just:
+./run-dev.sh
 
 # Access:
-#   http://localhost:8501  — Streamlit (Query · Ingest · Trace tabs)
+#   http://localhost:8501  — Streamlit (Chat · Pipeline · Session tabs)
 #   http://localhost:5000  — MLflow tracking UI
+```
+
+#### Multiple repositories
+
+Enter one or more repos (GitHub URLs or local paths), one per line, in the **Repos** field. Each is deterministically indexed into its own ChromaDB collection before the query runs — you'll see a `📂 <repo> → indexed (N docs)` line per repo. Cross-repo questions retrieve from all active collections with fair per-repo representation (see [Multi-Repo Retrieval](#multi-repo-retrieval)).
+
+`TOP_K` (default `10`) is the total chunks returned **across all active collections combined** — fair-merge splits this across repos, so raise it if a multi-repo query needs more per-repo coverage:
+
+```bash
+TOP_K=15 docker compose -f docker-compose.yml -f docker-compose.gpu.yml -f docker-compose.dev.yml up --build
 ```
 
 #### Deployment knobs
@@ -160,23 +184,25 @@ Three orthogonal axes compose independently:
 
 ```bash
 # Minimal tier — tightest memory, CI pipelines
-MODEL_TIER=minimal docker compose -f docker-compose_dev.yml up --build
+MODEL_TIER=minimal docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 # Balanced + q8_0 — near-lossless quality, more memory than q4
-MODEL_TIER=balanced QUANTISATION=q8_0 docker compose -f docker-compose_dev.yml up --build
+MODEL_TIER=balanced QUANTISATION=q8_0 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 # Supervisor-only review (no human in the loop)
-OUTPUT_REVIEW_MODE=supervisor docker compose -f docker-compose_dev.yml up --build
+OUTPUT_REVIEW_MODE=supervisor docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 # Disable HITL entirely
-HITL_ENABLED=false docker compose -f docker-compose_dev.yml up --build
+HITL_ENABLED=false docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
+
+Both `HITL_ENABLED` and `OUTPUT_REVIEW_MODE` are also live UI toggles (Configuration panel) — the env var sets the session default; the toggle overrides it per-query, read fresh from state on every request.
 
 #### vLLM backend (GPU required)
 
 ```bash
 INFERENCE_BACKEND=vllm \
-  docker compose -f docker-compose_dev.yml --profile vllm up --build
+  docker compose -f docker-compose.yml -f docker-compose.gpu.yml -f docker-compose.dev.yml --profile vllm up --build
 ```
 
 #### llama.cpp backend (CPU-native GGUF)
@@ -191,7 +217,7 @@ curl -L -o models/qwen2.5-coder-3b-instruct-q4_k_m.gguf \
 
 # 2. Start with the llamacpp profile
 MODEL_TIER=minimal INFERENCE_BACKEND=llamacpp \
-  docker compose -f docker-compose_dev.yml --profile llamacpp up --build
+  docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile llamacpp up --build
 ```
 
 llama-server exposes the same OpenAI-compatible API as vLLM — no code changes, just a different host.
@@ -203,23 +229,25 @@ MCP tools are only offered to `full` and `balanced` tier models (smaller models 
 ```bash
 # Enable Slack MCP
 MCP_SLACK_ENABLED=true MCP_SLACK_URL=http://your-slack-mcp:3002 \
-  docker compose -f docker-compose_dev.yml up --build
+  docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 # Enable GitHub MCP
 MCP_GITHUB_ENABLED=true MCP_GITHUB_URL=http://your-github-mcp:3001 \
-  docker compose -f docker-compose_dev.yml up --build
+  docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
 #### Graph DB (Kuzu)
 
 Built automatically during ingestion when `GRAPH_ENABLED=true` (default). No extra services — Kuzu is embedded.
 
+> Multi-repo note: the graph currently builds to a single shared path (`GRAPH_PATH`), so ingesting a second repo rebuilds it — the graph reflects the most recently ingested repo, not a merged view. ChromaDB is unaffected (per-repo collections are independent). Per-repo graph paths, or a repo-tagged shared graph for cross-repo structural queries, is a planned enhancement — see [Roadmap](#roadmap).
+
 ```bash
 # Disable graph build
-GRAPH_ENABLED=false docker compose -f docker-compose_dev.yml up --build
+GRAPH_ENABLED=false docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 # Adjust co-change history depth
-GRAPH_CO_CHANGE_COMMITS=200 docker compose -f docker-compose_dev.yml up --build
+GRAPH_CO_CHANGE_COMMITS=200 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
 ---
@@ -390,6 +418,20 @@ Embedding model and HNSW parameters are set at collection creation time. Changin
 
 ---
 
+## Multi-Repo Retrieval
+
+Enter one or more repos (GitHub URL or local path) in the Streamlit **Repos** field, one per line. Each is deterministically indexed before any query runs — indexing is *not* left to the agent to decide; a plain pre-query gate (`repo_index.py`) guarantees every listed repo exists in the vector store, idempotently (already-indexed repos are skipped, checked in milliseconds).
+
+**Design.**
+- **One embedding model, many collections.** Every repo is embedded with the same model — the same shared vector space — but stored in its own ChromaDB collection (`repo_<slug>_<hash>`, deterministic per repo ref, collision-resistant via a short hash of the full URL/path). Isolation is at the retrieval layer, not the embedding layer.
+- **Fair-merge retrieval.** `vector_search` accepts a `collections` list and merges results by interleaving within-collection rank — repo A's best chunk, repo B's best chunk, repo A's 2nd-best, and so on — rather than pooling all chunks and sorting by raw score. Pooled-by-score merging silently favours whichever repo's content happens to score higher on a given query (larger corpus, more central-vocabulary domain), which can starve a smaller or more tangential repo out of the context window entirely even when it's the one the question is actually about. Fair-merge guarantees every active repo gets representation proportional to `top_k`, not to its raw score.
+- **`TOP_K` is a total, not a per-repo count** (default `10`, `config.py`/env-driven). Fair-merge splits it across active collections — a 2-repo query gets up to 5 slots each; raise `TOP_K` for multi-repo queries that need more per-repo coverage, at the usual recall/precision-and-context-budget trade-off.
+- **Tool-selection is told the index exists.** The tool-selection prompt receives the active collection list explicitly (`Indexed repos (already embedded, use vector_search): ...`) and is instructed to prefer `vector_search` over single-file tools like `github_fetch` for already-indexed repos — without this, a capable model will still reasonably reach for fetching a README to "learn about" a repo it doesn't know is already searchable.
+
+**Not yet implemented:** cross-repo *structural* queries (the Kuzu graph is currently single-repo — see the Graph DB note under Quick Setup) and non-blocking first-time ingestion (adding a new, unindexed repo mid-session blocks the query until it's cloned and embedded, ~30–60s for a typical repo).
+
+---
+
 ## Testing
 
 ```bash
@@ -455,155 +497,9 @@ For a code documentation tool, keeping code local is a real-world requirement fo
 
 ---
 
-## How AI Tools Were Used in Development
+*For the full phase-by-phase design rationale — including the agent graph design, tool registry, inference backend factory, MLflow, Argo Workflows, the RLHF preference-learning pipeline, Helm deployment knobs, MCP integration, the graph database, and testing infrastructure (18 phases in total) — see [ARCHITECTURE.md](./ARCHITECTURE.md). For the multi-repo port done afterward and the failure modes hit getting it working end-to-end, see [DEBUGGING_JOURNEY.md](./DEBUGGING_JOURNEY.md), organised by layer (config vs. execution seam) rather than chronologically.*
 
-This project was developed with Claude (Anthropic) as a conversational development partner:
-- **Architecture decisions** were suggested by the developer, then discussed and debated with Claude
-- **Code generation** was mainly produced by Claude, with the developer reviewing, modifying, and testing all outputs
-- **Documentation** was defined mainly by the developer, with table/figure generation and large formatting tasks handled by Claude
-
-The key principle: AI tools accelerated development, but every decision and the core documentation (especially the "Evolution of thinking" sections) were made by the developer based on their own experience and judgment.
-
----
-
-## Journey Log (Development Process)
-
-This section documents the decision-making process chronologically. Each phase includes an **"Evolution of thinking"** subsection capturing how the system was developed and improved through conversation, debate, and real-world experience.
-
-A plan was made on how to approach the development in four phases:
-**1: LLM Provider Selection** | **2: Planning the pipeline** | **3: Deployment Format** | **4: Component Selection**
-
-### Phase 1: LLM Provider Selection — Why Ollama?
-
-**Decision: Ollama with an open-source model.**
-
-Considerations:
-- **Self-contained repo**: A reviewer can clone and run without API keys or paid accounts
-- **Engineering depth**: Standing up the full inference stack showcases CI/CD, deployment, infrastructure-aware ML design
-- **Privacy**: For a code documentation tool, keeping code local is a real-world requirement for many organisations
-
-Trade-off acknowledged: hosted APIs produce higher-quality responses for complex code reasoning. A hybrid approach (local for simple queries, API fallback for complex reasoning) is the production ideal. Optimising for engineering capability was the deliberate choice here.
-
-**Evolution of thinking:** The initial framing was "which hosted API?". The reframing: a Lead AI Engineer has broader scope than API consumption. Wrapping an API is a weekend project; the full inference stack demonstrates infrastructure ownership. Later: vLLM was added as a second backend (GPU, high-throughput) and llama.cpp/llama-server as a third (CPU-native GGUF, lowest overhead, specifically paired with `lightweight`/`minimal` tiers where it outperforms the Ollama wrapper).
-
-### Phase 2: Planning the Approach — README-Driven Development
-
-**Decision: README as a living design document, developed alongside the code.**
-
-Writing the README *during* development captures the actual thought process — trade-offs, inflection points, moments where understanding shifted. Several technical choices (embedding model selection, vector DB architecture) were refined because writing them down forced sharper thinking.
-
-### Phase 3: Deployment Format — Docker Compose AND Helm
-
-**Decision: Both, serving different purposes.**
-
-| | Docker Compose | Helm Chart |
-|--|---------------|------------|
-| Purpose | Local dev, reviewer convenience | Production-grade deployment |
-| Demonstrates | "I can containerise an app" | "I think in deployable, scalable units" |
-
-The Helm chart models the system as separate concerns: Ollama → StatefulSet, ChromaDB → StatefulSet, App → Deployment. This separation *is* the architecture, expressed as infrastructure-as-code. The three-axis knob system (`modelTier` × `quantisation` × `deploymentTarget`) on `dev` extends this composability principle to inference backend selection.
-
-**Evolution of thinking:** Writing both forced thinking from two perspectives simultaneously. The Helm chart naturally surfaced the composability patterns (`_helpers.tpl` tier system) that wouldn't have emerged from Docker Compose alone.
-
-### Phase 4: Component Selection
-
-#### 4a. LLM Model — A Tiered, Configurable Approach
-
-**Decision: Model as a configuration value, not a hard dependency.**
-
-A single `modelTier` value cascades through the entire system: model selection, quantisation suffix, resource allocation, context window, timeouts, chunking strategy, and inference backend affinity.
-
-```mermaid
-flowchart LR
-    MT["modelTier=balanced"] --> M["deepseek-coder-v2:16b-lite-instruct"]
-    Q["quantisation=q4_K_M"] --> TAG["final tag:\ndeepseek-coder-v2:16b-lite-instruct-q4_K_M"]
-    M --> TAG
-    TAG --> RES["resource limits\nCPU/GPU allocation"]
-    MT --> CTX["ctx 8192\ntimeout 120s"]
-    MT --> CHUNK["AST chunking"]
-```
-
-| Tier | Model | Notes |
-|------|-------|-------|
-| `full` | mistral-nemo:12b-instruct | Best code comprehension + NL explanation |
-| `balanced` | deepseek-coder-v2:16b-lite-instruct | MoE architecture; best code understanding at mid-range |
-| `lightweight` | phi3.5 | Runs on almost anything; CPU-ok |
-| `minimal` | qwen2.5-coder:3b-instruct | CI pipelines; very constrained machines |
-
-*`balanced` was updated from `qwen2.5-coder:7b` — DeepSeek V2 Lite's MoE architecture is more effective for multi-language code understanding within the same memory envelope at Q4.*
-
-#### 4b. Embedding Model
-
-⚠️ Changing after ingestion requires full re-ingestion. The `_helpers.tpl` derives vector dimension from the embedding model choice to prevent silent failures.
-
-Two axes characterise the input: language distribution (single vs. multi-language) and documentation state (none / partial / full). The embedding model choice follows from the input, not from infrastructure preference.
-
-#### 4c. Vector Database + Graph Database
-
-**Decision: ChromaDB (semantic) + Kuzu (structural) — orthogonal, not alternatives.**
-
-```mermaid
-flowchart LR
-    subgraph RETRIEVAL["Retrieval"]
-        VS["Vector Search\nChromaDB\nsemantic / approximate"]
-        GT["Graph Traverse\nKuzu\nstructural / exact"]
-    end
-
-    Q1["'How does X work?'"] --> VS
-    Q2["'What calls X?'"] --> GT
-    Q3["'What changed with X?'"] --> GT
-```
-
-For the abstraction rationale (FAISS vs ChromaDB vs Qdrant), see ARCHITECTURE.md Phase 4.
-
-#### 4d. Orchestration
-
-`master`: LlamaIndex RAG — purpose-built, native `CodeSplitter`, lighter weight for pure retrieval-and-respond.
-
-`dev`: LangGraph agent — tool selection → HITL-1 → tool execution → supervisor → generation → HITL-2. The ingestion path (LlamaIndex) is unchanged on both branches.
-
-#### 4e. Chunking Strategy
-
-AST-based (tree-sitter) for `full`/`balanced` tiers, text-based fallback for `lightweight`/`minimal`. Resolved automatically from `modelTier` by `_helpers.tpl`. The fallback always exists as a safety net regardless of configuration.
-
-#### 4f. Interface
-
-`master`: single-tab chat UI with sidebar ingestion controls.
-
-`dev`: three tabs — **Query** (chat + HITL panels), **Ingest** (repo ingestion with graph build toggle), **Trace** (LangGraph execution trace with node highlighting).
-
-#### 4g. RAG Quality and Limitations
-
-RAG is not unconditionally beneficial — retrieval noise can actively degrade quality. Code-specific risks: stale context, partial context (function without imports), cross-file naming confusion. Mitigations: similarity score cutoff (0.3), metadata preservation, source attribution. On `dev`, the supervisor adjusts retrieval parameters between attempts based on confidence scores.
-
-#### 4h. Guardrails
-
-Domain-specific for code documentation: hallucination prevention (prompt-level + source attribution), credential redaction (flagged as production requirement). Source attribution is itself a guardrail — the developer can verify claims against actual code.
-
-### Phase 5: Implementation
-
-Key outcomes:
-- Python modules: `config.py`, `vector_store.py`, `ingest.py`, `query_engine.py`, `app.py` (master); + `agent_graph.py`, `agent_state.py`, `tools.py`, `graph_store.py` (dev)
-- ChromaDB HNSW parameters now explicitly tuned (M, construction_ef, search_ef) — not left at defaults
-- Split tool registry: local tools always available; MCP tools gated by `is_mcp_capable()` and server enabled flag
-- Three inference backends: Ollama (default), vLLM (GPU), llama-server/llama.cpp (CPU-native GGUF)
-- MLflow as system-level observability: logs every agent run and every ingestion run independently of backend
-
-### Phase 6: Testing & Refinement
-
-**62 tests, 9 classes, no external services required.**
-
-Bugs found during test authoring that would have caused silent production failures:
-1. Kuzu `mkdir` before init → "cannot be a directory" error
-2. Kuzu `reset()` used `shutil.rmtree` on a file, not a directory
-3. `end` is a reserved word in Kuzu Cypher → parser exception
-4. Top-level Ollama import in `ingest.py` → import failure in test environments
-
-**Evolution of thinking:** The test suite was designed to exercise as much of the codebase as possible without external services. The bugs found — particularly the Kuzu reserved word and the `reset()` file-vs-directory issue — would have been invisible until first deployment.
-
----
-
-## What I'd Do Differently With More Time
+## Roadmap
 
 ### Model Fine-Tuning
 
@@ -616,6 +512,8 @@ CRAG, Self-RAG, re-ranking, and GraphRAG (graph traversal to identify structural
 ### Graph-Aware Retrieval
 
 The code dependency graph (`dev`) is the first layer. The knowledge graph — concepts, design decisions, architectural components — is the research extension. See `RESEARCH_orchestrated.md` for the full treatment of upward/downward/lateral structure transition dynamics.
+
+**Multi-repo graph.** The graph currently builds to one shared path, so it reflects only the most recently ingested repo (see the Graph DB note under Quick Setup). The natural extension once multi-repo retrieval is stable: either per-repo graph paths (mirroring the per-repo ChromaDB collections — low-risk, no cross-repo structural reasoning) or a single repo-tagged graph enabling genuinely cross-repo structural queries ("what in repo A would break if repo B's interface changed?") — the more interesting version, and a deliberate next step rather than an accidental side effect of the multi-repo port.
 
 ### With Known Infrastructure: vLLM, Quantisation, Production Inference
 
@@ -631,9 +529,3 @@ In a production environment with known GPU topology: vLLM continuous batching + 
 - **Configuration**: environment-variable driven, full parity between Docker Compose and Helm
 - **Testing**: 62 unit tests, no external services, covers all new components
 - **Observability**: MLflow for system-level experiment tracking; structured logging; configurable log level
-
----
-
-## Reviewer Note
-
-I am willing to provide the full conversation transcripts from the development sessions with Claude, which helped develop this project. These transcripts show the unedited back-and-forth — including corrections and the moments where ideas were realigned — and provide additional context for the decision-making documented in this Journey Log.

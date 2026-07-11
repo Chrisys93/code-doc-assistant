@@ -27,7 +27,19 @@ st.set_page_config(
 def _get_graph():
     from agent_graph import build_graph
     from langgraph.checkpoint.memory import MemorySaver
-    return build_graph(checkpointer=MemorySaver())
+    # Debug-log #15: MemorySaver's default jsonplus serde doesn't know our
+    # custom dataclasses (ToolCall, HITLCheckpoint, SupervisorAdjustment),
+    # which logs "Deserializing unregistered type ... will be blocked in a
+    # future version" on every resume. pickle_fallback lets it (de)serialize
+    # them safely now, before that becomes a hard error.
+    try:
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+        checkpointer = MemorySaver(serde=JsonPlusSerializer(pickle_fallback=True))
+    except TypeError:
+        # Pinned LangGraph version doesn't accept pickle_fallback — fall back
+        # to the plain saver rather than breaking the build.
+        checkpointer = MemorySaver()
+    return build_graph(checkpointer=checkpointer)
 
 def _get_mermaid() -> str:
     from agent_graph import get_graph_mermaid
@@ -179,15 +191,18 @@ def _render_hitl2(response: str, sources: list, attempt: int) -> dict | None:
 with st.expander("⚙️ Configuration", expanded=False):
     cc = st.columns(5)
     with cc[0]:
-        repo_path = st.text_input("Repo path", value=os.environ.get("REPO_PATH", "/data/repos/myrepo"))
+        repos_raw = st.text_area("Repos (one per line)",
+                                 value=os.environ.get("REPO_PATH", "/data/repos/myrepo"),
+                                 help="Git URLs or local paths. Each is indexed into its own collection before you query.")
+        repos = [r.strip() for r in repos_raw.splitlines() if r.strip()]
+        repo_path = repos[0] if repos else ""   # back-compat: existing code still reads repo_path
+        st.session_state.repos = repos
     with cc[1]:
         hitl1_on = st.toggle("Tool plan HITL", value=True)
     with cc[2]:
         review_mode = st.selectbox("Output review mode",
                                    ["human", "supervisor", "self", "off"],
-                                   index=["human","supervisor","self","off"].index(
-                                       st.session_state.output_review_mode))
-        st.session_state.output_review_mode = review_mode
+                                   key="output_review_mode")
     with cc[3]:
         max_ret = st.slider("Max retrieval retries", 1, 5, 3)
         conf_thr = st.slider("Confidence threshold", 0.1, 0.9, 0.45, 0.05)
@@ -195,7 +210,10 @@ with st.expander("⚙️ Configuration", expanded=False):
         max_gen = st.slider("Max generation attempts", 1, 3, 3)
         gate_thr = st.slider("Quality gate (supervisor)", 0.0, 10.0, 6.0, 0.5)
 
-    os.environ["HITL_ENABLED"] = "true" if hitl1_on else "false"
+    # NOTE: os.environ["HITL_ENABLED"] used to be set here, but HITL_ENABLED is
+    # read once at agent_graph's module import — setting it per-rerun had no
+    # effect after the first request. hitl1_on is now passed straight into the
+    # graph's init state below, which node_hitl_checkpoint reads live.
     os.environ["OUTPUT_REVIEW_MODE"] = review_mode
     os.environ["MAX_RETRIEVAL_ATTEMPTS"] = str(max_ret)
     os.environ["MAX_GENERATION_ATTEMPTS"] = str(max_gen)
@@ -224,7 +242,11 @@ with tab_pipeline:
         mermaid_src = _get_mermaid()
         trace = st.session_state.last_trace
         html = _mermaid_html(mermaid_src, trace if trace else None)
-        st.components.v1.html(html, height=520, scrolling=False)
+        # st.components.v1.html is deprecated (removed after 2026-06-01); st.iframe
+        # takes a src URL rather than raw HTML, so render via a data: URI.
+        import base64
+        b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
+        st.iframe(src=f"data:text/html;base64,{b64}", height=520, scrolling=False)
 
         if trace:
             st.subheader("Last execution trace")
@@ -360,6 +382,14 @@ with tab_chat:
             with st.chat_message("user"):
                 st.markdown(prompt)
 
+            from repo_index import ensure_indexed, active_collections
+            _chroma = os.environ.get("CHROMA_HOST", "http://chromadb:8000")
+            with st.spinner("Ensuring repos are indexed…"):
+                status = ensure_indexed(st.session_state.get("repos", []), _chroma)
+            st.session_state.active_collections = active_collections(st.session_state.get("repos", []))
+            for ref, s in status.items():
+                st.caption(f"📂 {ref.split('/')[-1]} → {s['status']} ({s['docs']} docs)")
+
             graph = _get_graph()
             cfg = {"configurable": {"thread_id": st.session_state.thread_id}}
             extra: dict[str, Any] = {}
@@ -368,6 +398,8 @@ with tab_chat:
 
             init: dict[str, Any] = {
                 "query": prompt, "repo_path": repo_path,
+                "hitl_enabled": hitl1_on, "output_review_mode": review_mode,
+                "active_collections": st.session_state.get("active_collections", []),
                 "proposed_tool_calls": [], "hitl_checkpoint": None,
                 "approved_tool_calls": [], "executed_tool_calls": [],
                 "retrieved_chunks": [], "confidence_scores": [],
@@ -378,6 +410,13 @@ with tab_chat:
                 "execution_trace": [], "mlflow_run_id": None, "total_latency_ms": None,
                 **extra,
             }
+
+            import logging
+            logging.getLogger(__name__).warning(
+                "DIAG init: repos=%r active_collections=%r hitl_enabled=%r output_review_mode=%r",
+                st.session_state.get("repos"), init["active_collections"],
+                init["hitl_enabled"], init["output_review_mode"],
+            )
 
             with st.spinner("Agent selecting tools..."):
                 try:

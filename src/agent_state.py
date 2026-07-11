@@ -132,6 +132,9 @@ class AgentState(TypedDict):
     # --- Input ---
     query: str                                      # user's original question
     repo_path: str                                  # mounted repo path (e.g. /data/repos/myrepo)
+    active_collections: list[str]                   # per-repo ChromaDB collections to search (multi-repo)
+    hitl_enabled: bool                              # live UI toggle — read by node_hitl_checkpoint
+    output_review_mode: str                         # live UI selector — read by node_generation/node_output_review
 
     # --- Tool selection ---
     proposed_tool_calls: list[ToolCall]             # what the tool-selection agent wants to run

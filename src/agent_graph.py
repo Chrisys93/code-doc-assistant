@@ -174,9 +174,15 @@ Available tools:
 Rules:
 1. Choose the minimum set of tools that will answer the query well.
 2. For specific file/function questions: prefer grep + cat + ast_parse.
-3. For conceptual/architectural questions: prefer vector_search.
+3. For conceptual/architectural questions (e.g. "how does X work", "could A integrate
+   with B", "what does this repo do"): prefer vector_search over any other tool.
 4. For questions about change history: use git_log or git_blame.
 5. Combine tools when needed (e.g. find → grep → cat is a common chain).
+6. If the query mentions "Indexed repos" below, those repos are ALREADY embedded and
+   searchable — use vector_search against them. Do NOT use github_fetch to read a
+   single file (like README.md) from an indexed repo as a substitute for search;
+   github_fetch is only for repos/files that are NOT in the indexed list, or for a
+   specific named file the user explicitly asked to see verbatim.
 
 Respond ONLY with a JSON array of tool calls. Each element must have:
   {{"tool_name": str, "args": {{...}}, "reasoning": str}}
@@ -199,7 +205,12 @@ def node_tool_selection(state: AgentState) -> dict[str, Any]:
         for name, meta in registry.items()
     )
     system_msg = TOOL_SELECTION_SYSTEM.format(tool_descriptions=tool_descs)
-    user_msg = f"Query: {state['query']}\nRepo path: {state['repo_path']}"
+    active_cols = state.get("active_collections") or []
+    if active_cols:
+        indexed_note = f"\nIndexed repos (already embedded, use vector_search): {', '.join(active_cols)}"
+    else:
+        indexed_note = ""
+    user_msg = f"Query: {state['query']}\nRepo path: {state['repo_path']}{indexed_note}"
 
     llm = _get_llm(temperature=0.0)
     response = llm.invoke([SystemMessage(content=system_msg), HumanMessage(content=user_msg)])
@@ -236,12 +247,19 @@ def node_hitl_checkpoint(state: AgentState) -> dict[str, Any]:
     """
     Human-in-the-loop review of the proposed tool plan.
 
-    When HITL_ENABLED=true: pauses execution with interrupt(), waiting for
-    human approval via graph.invoke(Command(resume={...})).
+    hitl_enabled comes from state (set fresh by app.py from the UI toggle on
+    every request) so it's a genuine per-request setting, not a value frozen
+    at process start. Falls back to the HITL_ENABLED env default only when a
+    caller invokes the graph without setting it in state.
 
-    When HITL_ENABLED=false (CI/automated): auto-approves.
+    When enabled: pauses execution with interrupt(), waiting for human
+    approval via graph.invoke(Command(resume={...})).
+    When disabled: auto-approves.
     """
-    if not HITL_ENABLED:
+    hitl = state.get("hitl_enabled")
+    if hitl is None:
+        hitl = HITL_ENABLED
+    if not hitl:
         return {
             "approved_tool_calls": state["proposed_tool_calls"],
             "hitl_checkpoint": HITLCheckpoint(
@@ -297,8 +315,13 @@ def node_tool_execution(state: AgentState) -> dict[str, Any]:
     approved = state.get("approved_tool_calls", [])
     executed: list[ToolCall] = []
     new_chunks: list[Chunk] = []
+    active_cols = state.get("active_collections", [])
 
     for tc in approved:
+        # Deterministically scope vector_search to the active per-repo collections
+        # (default: all). The model may narrow by supplying its own 'collections'.
+        if tc.tool_name == "vector_search" and active_cols and "collections" not in tc.args:
+            tc.args["collections"] = active_cols
         result = run_tool(tc.tool_name, tc.args)
         tc.result = result.get("result", "") or json.dumps(result.get("chunks", []))
         tc.success = result.get("success", False)
@@ -479,7 +502,15 @@ def node_context_assembly(state: AgentState) -> dict[str, Any]:
     """
     chunks = state.get("retrieved_chunks", [])
 
-    # Deduplicate by content hash
+    # Deduplicate by content hash, preserving arrival order.
+    # IMPORTANT: do NOT re-sort by raw confidence here. retrieved_chunks already
+    # arrives fair-merged across collections (tool_vector_search interleaves by
+    # within-collection rank so a smaller/lower-scoring repo isn't crowded out —
+    # see tools.py). A global confidence sort at this stage silently undoes that:
+    # if one repo's chunks score systematically higher (different domain, more
+    # directly relevant vocabulary), they'd all float to the front and the trim
+    # below would truncate the other repo out first — exactly the failure mode
+    # multi-repo fair-merge exists to prevent.
     seen: set[int] = set()
     unique: list[Chunk] = []
     for c in chunks:
@@ -487,9 +518,6 @@ def node_context_assembly(state: AgentState) -> dict[str, Any]:
         if h not in seen:
             seen.add(h)
             unique.append(c)
-
-    # Sort by confidence descending
-    unique.sort(key=lambda c: c.confidence, reverse=True)
 
     # Trim to context window (rough token estimate: 1 token ≈ 4 chars)
     max_chars = MAX_CONTEXT_TOKENS * 4
@@ -576,10 +604,11 @@ def node_generation(state: AgentState) -> dict[str, Any]:
     ])
     draft = response.content
     gen_attempts = state.get("generation_attempts", 0) + 1
+    gen_mode = state.get("output_review_mode") or OUTPUT_REVIEW_MODE
 
-    # Self-critique pass (only when OUTPUT_REVIEW_MODE="self")
+    # Self-critique pass (only when output review mode == "self", read live from state)
     final_response = draft
-    if OUTPUT_REVIEW_MODE == "self":
+    if gen_mode == "self":
         critique_response = llm.invoke([
             SystemMessage(content=SELF_CRITIQUE_PROMPT.format(query=query)),
             HumanMessage(content=f"Context:\n{context}\n\nYour draft:\n{draft}"),
@@ -597,7 +626,7 @@ def node_generation(state: AgentState) -> dict[str, Any]:
         pass
 
     trace = list(state.get("execution_trace", []))
-    mode_note = " (+ self-critique)" if OUTPUT_REVIEW_MODE == "self" else ""
+    mode_note = " (+ self-critique)" if gen_mode == "self" else ""
     trace.append({"node": "generation", "status": "ok",
                   "detail": f"generated {len(final_response)} chars{mode_note}"})
     return {
@@ -644,9 +673,10 @@ def node_output_review(state: AgentState) -> dict[str, Any]:
     prefs: SessionPreferences = state.get("session_preferences") or SessionPreferences()
     gen_attempts = state.get("generation_attempts", 1)
     trace = list(state.get("execution_trace", []))
+    mode = state.get("output_review_mode") or OUTPUT_REVIEW_MODE
 
     # --- "off" and "self" modes: passthrough ---
-    if OUTPUT_REVIEW_MODE in ("off", "self"):
+    if mode in ("off", "self"):
         feedback = PostGenerationFeedback(
             response_shown=state.get("response", ""),
             decision="accept",
@@ -654,12 +684,12 @@ def node_output_review(state: AgentState) -> dict[str, Any]:
         )
         prefs.update(feedback)
         trace.append({"node": "output_review", "status": "ok",
-                      "detail": f"mode={OUTPUT_REVIEW_MODE}, auto-accept"})
+                      "detail": f"mode={mode}, auto-accept"})
         return {"post_generation_feedback": feedback, "session_preferences": prefs,
                 "execution_trace": trace}
 
     # --- "supervisor" mode: LLM quality gate ---
-    if OUTPUT_REVIEW_MODE == "supervisor":
+    if mode == "supervisor":
         if gen_attempts >= MAX_GENERATION_ATTEMPTS:
             # Max attempts reached — accept whatever we have
             feedback = PostGenerationFeedback(
@@ -805,7 +835,8 @@ def _route_after_output_review(
 # Build the graph — topology varies by OUTPUT_REVIEW_MODE
 # ---------------------------------------------------------------------------
 
-def build_graph(checkpointer=None, output_review_mode: str | None = None) -> Any:
+def build_graph(checkpointer=None, output_review_mode: str | None = None,
+                hitl_enabled: bool | None = None) -> Any:
     """
     Construct and compile the LangGraph StateGraph.
 
@@ -821,8 +852,15 @@ def build_graph(checkpointer=None, output_review_mode: str | None = None) -> Any
     Args:
         checkpointer:       Optional LangGraph checkpointer for persistence.
         output_review_mode: Override OUTPUT_REVIEW_MODE (for testing / notebook use).
+        hitl_enabled:       Override HITL_ENABLED (for testing / notebook use).
+                            Both env-based defaults are resolved at module import,
+                            so a UI toggle changing os.environ AFTER that point has
+                            no effect unless passed explicitly here — this is the
+                            hook for that. Callers (e.g. app.py) should pass the
+                            live toggle value on every build_graph() call.
     """
     mode = output_review_mode or OUTPUT_REVIEW_MODE
+    hitl = HITL_ENABLED if hitl_enabled is None else hitl_enabled
 
     builder = StateGraph(AgentState)
     builder.add_node("tool_selection", node_tool_selection)
@@ -858,13 +896,15 @@ def build_graph(checkpointer=None, output_review_mode: str | None = None) -> Any
     if checkpointer:
         compile_kwargs["checkpointer"] = checkpointer
 
-    interrupt_nodes = []
-    if HITL_ENABLED:
-        interrupt_nodes.append("hitl_checkpoint")
-    if mode == "human":
-        interrupt_nodes.append("output_review")
-    if interrupt_nodes:
-        compile_kwargs["interrupt_before"] = interrupt_nodes
+    # NOTE: interrupt_before is intentionally NOT used here. It's a compile-time
+    # (per-graph) setting and can't vary per-request, which is exactly the bug
+    # that made the HITL toggle a no-op: this graph is built once and cached.
+    # The dynamic interrupt() calls inside node_hitl_checkpoint / node_output_review
+    # are the real, correct pause mechanism — they now read the live toggle value
+    # from state (state["hitl_enabled"], state["output_review_mode"]) on every
+    # request, set fresh by app.py each time. `hitl` / `mode` above remain as the
+    # module-level fallback when a caller invokes the graph without setting them
+    # in state (e.g. tests, notebook use).
 
     return builder.compile(**compile_kwargs)
 def get_graph_mermaid() -> str:

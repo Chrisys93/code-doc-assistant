@@ -220,52 +220,112 @@ def tool_stat(repo_path: str, file_path: str) -> dict[str, Any]:
     return {"result": output, "success": success}
 
 
-def tool_vector_search(query: str, chroma_host: str, collection_name: str = "codebase",
-                       top_k: int = 5, score_threshold: float = 0.3,
+def tool_vector_search(query: str, chroma_host: str = "", collection_name: str = "codebase",
+                       collections: Any = None, top_k: int = None, score_threshold: float = 0.3,
                        filter_file: str = "") -> dict[str, Any]:
     """
     Semantic vector search against ChromaDB.
 
+    Searches one collection (collection_name) OR several (collections: a list, or
+    a comma-separated string), merging results across all of them by similarity
+    score with fair per-repo representation. This enables multi-repo queries:
+    each repo lives in its own collection; a query can span one, a group, or all.
+
     Args:
         query:            Natural language or code query
-        chroma_host:      ChromaDB HTTP host (e.g. http://chromadb:8000)
-        collection_name:  Collection to search
-        top_k:            Number of results to return
+        chroma_host:      ChromaDB HTTP host (defaults to $CHROMA_HOST)
+        collection_name:  Single collection to search (fallback if `collections` empty)
+        collections:      list[str] or "a,b,c" — collections to search & merge
+        top_k:            Total chunks returned across ALL collections combined
+                          (defaults to config.TOP_K if the planner doesn't specify
+                          one — raise TOP_K in the environment for more per-repo
+                          coverage on multi-repo queries; fair-merge splits this
+                          across active collections, so top_k=10 on a 2-repo query
+                          gives each repo up to 5 slots instead of top_k=5's ~2-3)
         score_threshold:  Minimum similarity score (0–1)
         filter_file:      Optional: restrict to chunks from this file path
     """
+    if top_k is None:
+        try:
+            from config import TOP_K
+            top_k = TOP_K
+        except ImportError:
+            top_k = 5
     try:
+        chroma_host = chroma_host or os.environ.get("CHROMA_HOST", "http://chromadb:8000")
         import chromadb
         client = chromadb.HttpClient(host=chroma_host.replace("http://", "").split(":")[0],
                                      port=int(chroma_host.split(":")[-1]))
-        collection = client.get_collection(collection_name)
 
-        where = {"source_file": {"$eq": filter_file}} if filter_file else None
-        results = collection.query(
-            query_texts=[query],
-            n_results=top_k,
-            where=where,
-            include=["documents", "metadatas", "distances"]
+        # Resolve target collections: `collections` (list or CSV) wins, else the single name.
+        if collections:
+            if isinstance(collections, str):
+                targets = [c.strip() for c in collections.split(",") if c.strip()]
+            else:
+                targets = [str(c).strip() for c in collections if str(c).strip()]
+        else:
+            targets = [collection_name]
+
+        # Embed the query ONCE with the SAME model used at ingestion (nomic-embed-text,
+        # 768-dim, via Ollama). Passing query_embeddings prevents Chroma from falling back
+        # to its default all-MiniLM embedder (384-dim), which mismatches the stored vectors
+        # and makes every query fail silently into 0 results.
+        from llama_index.embeddings.ollama import OllamaEmbedding
+        embed_model = OllamaEmbedding(
+            model_name=os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"),
+            base_url=os.environ.get("OLLAMA_HOST", "http://ollama:11434"),
         )
+        query_vec = embed_model.get_query_embedding(query)
+        where = {"file_path": {"$eq": filter_file}} if filter_file else None
 
         chunks = []
-        for doc, meta, dist in zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0]
-        ):
-            score = 1 - dist  # ChromaDB returns L2 distance; invert for similarity
-            if score >= score_threshold:
-                chunks.append({
-                    "content": doc,
-                    "source_file": meta.get("source_file", "unknown"),
-                    "start_line": meta.get("start_line"),
-                    "end_line": meta.get("end_line"),
-                    "chunk_type": meta.get("chunk_type", "text"),
-                    "confidence": round(score, 4)
-                })
+        searched = []
+        for cname in targets:
+            try:
+                collection = client.get_collection(cname)
+            except Exception:
+                continue  # collection missing (repo not indexed) — skip, search the rest
+            searched.append(cname)
+            results = collection.query(
+                query_embeddings=[query_vec],
+                n_results=top_k,
+                where=where,
+                include=["documents", "metadatas", "distances"],
+            )
+            if not results.get("documents") or not results["documents"][0]:
+                continue
+            for doc, meta, dist in zip(results["documents"][0],
+                                       results["metadatas"][0],
+                                       results["distances"][0]):
+                score = 1 - dist
+                if score >= score_threshold:
+                    chunks.append({
+                        "content": doc,
+                        "source_file": meta.get("file_path") or meta.get("source_file", "unknown"),
+                        "start_line": meta.get("start_line"),
+                        "end_line": meta.get("end_line"),
+                        "chunk_type": meta.get("chunk_type", "text"),
+                        "repo": cname,
+                        "confidence": round(score, 4),
+                    })
 
-        return {"chunks": chunks, "success": True, "count": len(chunks)}
+        # Fair merge across collections: interleave by within-collection rank so a larger
+        # repo can't crowd out a smaller one. (Single collection → plain score order.)
+        by_repo: dict[str, list] = {}
+        for c in chunks:
+            by_repo.setdefault(c["repo"], []).append(c)
+        for r in by_repo:
+            by_repo[r].sort(key=lambda c: c["confidence"], reverse=True)
+        merged: list = []
+        rank = 0
+        while len(merged) < top_k and any(rank < len(v) for v in by_repo.values()):
+            for v in by_repo.values():
+                if rank < len(v) and len(merged) < top_k:
+                    merged.append(v[rank])
+            rank += 1
+
+        return {"chunks": merged, "success": True, "count": len(merged),
+                "collections_searched": searched}
     except Exception as e:
         return {"chunks": [], "success": False, "error": str(e)}
 
@@ -625,7 +685,7 @@ LOCAL_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "fn": tool_vector_search,
         "description": "Semantic similarity search over embedded code chunks. Best for: conceptual questions ('how does caching work?'), cross-file relationships, architectural questions.",
         "required_args": ["query", "chroma_host"],
-        "optional_args": ["collection_name", "top_k", "score_threshold", "filter_file"],
+        "optional_args": ["collection_name", "collections", "top_k", "score_threshold", "filter_file"],
     },
     "ast_parse": {
         "type": "local",
@@ -783,23 +843,47 @@ def run_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """
     Execute a registered tool by name. Dispatches identically for local and MCP tools.
     Returns the tool's result dict, always with a 'latency_ms' key appended.
+
+    The planner (LLM) sometimes emits args a tool doesn't accept, or omits a
+    required one. Both are handled here so a malformed plan degrades gracefully
+    (skips this tool, keeps the rest of the plan alive) instead of raising —
+    and, critically, both paths populate 'error' so callers can see WHY.
     """
     registry = build_tool_registry()
     if name not in registry:
-        return {"result": f"Unknown tool: {name!r}. Available: {list(registry)}", "success": False}
+        return {"result": f"Unknown tool: {name!r}. Available: {list(registry)}",
+                "success": False, "error": f"unknown tool: {name!r}"}
 
     entry = registry[name]
     start = time.time()
+
+    if entry["type"] == "local":
+        import inspect
+        fn = entry["fn"]
+        sig = inspect.signature(fn)
+        filtered = {k: v for k, v in args.items() if k in set(sig.parameters)}
+        missing = [
+            n for n, p in sig.parameters.items()
+            if p.default is inspect.Parameter.empty
+            and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+            and n not in filtered
+        ]
+        if missing:
+            return {"result": f"skipped {name!r}: planner omitted required args {missing}",
+                    "success": False, "error": f"missing required args: {missing}",
+                    "latency_ms": round((time.time() - start) * 1000, 1)}
+        call_args = filtered
+    else:
+        call_args = args  # MCP adapters: pass through as-is
+
     try:
-        if entry["type"] == "local":
-            result = entry["fn"](**args)
-        else:
-            # MCP: fn is an MCPToolAdapter instance, callable with kwargs
-            result = entry["fn"](**args)
+        result = entry["fn"](**call_args)
     except TypeError as e:
-        result = {"result": f"Argument error calling {name!r}: {e}", "success": False}
+        result = {"result": f"Argument error calling {name!r}: {e}",
+                  "success": False, "error": str(e)}
     except Exception as e:
-        result = {"result": f"Tool error in {name!r}: {e}", "success": False}
+        result = {"result": f"Tool error in {name!r}: {e}",
+                  "success": False, "error": str(e)}
 
     result["latency_ms"] = round((time.time() - start) * 1000, 1)
     return result
