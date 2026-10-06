@@ -43,12 +43,35 @@ spec:
             - name: LOG_LEVEL
               value: {{ .Values.app.env.LOG_LEVEL | quote }}
             # --- Dev branch additions ---
+            # "ollama" / "vllm" / "llamacpp" pin the backend (the app's "container
+            # default"); "auto" lets the app probe what is deployed (deployment.py).
             - name: INFERENCE_BACKEND
               value: {{ .Values.inferenceBackend | quote }}
             - name: VLLM_HOST
               value: {{ include "code-doc-assistant.vllmHost" . }}
+            - name: LLAMACPP_HOST
+              value: {{ include "code-doc-assistant.llamacppHost" . }}
+            {{- if include "code-doc-assistant.llamacppEnabled" . }}
+            # Only the FALLBACK name: the app reads the real one from llama-server.
+            - name: LLAMACPP_MODEL
+              value: {{ include "code-doc-assistant.llamacppServedName" . | quote }}
+            {{- end }}
+            - name: EMBED_NUM_GPU
+              value: {{ .Values.embedNumGpu | quote }}
+            - name: MAX_REPLANS
+              value: {{ .Values.maxReplans | quote }}
+            {{- if .Values.mlflow.enabled }}
             - name: MLFLOW_TRACKING_URI
               value: {{ include "code-doc-assistant.mlflowHost" . }}
+            - name: MLFLOW_UI_URL
+              value: {{ .Values.mlflow.uiUrl | quote }}
+            - name: MLFLOW_EXPERIMENT
+              value: {{ .Values.mlflow.experiment | quote }}
+            {{- if .Values.evalGroup }}
+            - name: EVAL_GROUP
+              value: {{ .Values.evalGroup | quote }}
+            {{- end }}
+            {{- end }}
             - name: HITL_ENABLED
               value: {{ .Values.hitlEnabled | quote }}
             - name: OUTPUT_REVIEW_MODE
@@ -76,9 +99,4 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 30
           resources:
-            requests:
-              memory: "512Mi"
-              cpu: "250m"
-            limits:
-              memory: "1Gi"
-              cpu: "1"
+            {{- include "code-doc-assistant.appResources" . | nindent 12 }}

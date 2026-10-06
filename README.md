@@ -103,7 +103,7 @@ flowchart TD
 ### Prerequisites
 
 - Docker & Docker Compose
-- (Optional) NVIDIA GPU + drivers for full/balanced tier performance
+- (Optional) NVIDIA GPU + drivers for full/heavy tier performance
 - (Optional) A Kubernetes cluster + Helm for production deployment
 
 ---
@@ -177,9 +177,9 @@ Three orthogonal axes compose independently:
 
 | Knob | Values | Default | Effect |
 |------|--------|---------|--------|
-| `MODEL_TIER` | `full` `balanced` `lightweight` `minimal` | `full` | Which model |
+| `MODEL_TIER` | `heavy` `full` `balanced` `lightweight` `minimal` | `full` | Which model |
 | `QUANTISATION` | `q4_K_M` `q8_0` `fp16` | `q4_K_M` | Memory vs quality |
-| `INFERENCE_BACKEND` | `ollama` `vllm` `llamacpp` | `ollama` | Inference server |
+| `INFERENCE_BACKEND` | `auto` `ollama` `vllm` `llamacpp` | `auto` (dev compose), `ollama` otherwise | Inference server; `auto` follows what is running |
 | `DEPLOYMENT_TARGET` | `local` `cluster` | `local` | Resource profile + HNSW tuning |
 
 ```bash
@@ -207,7 +207,7 @@ INFERENCE_BACKEND=vllm \
 
 #### llama.cpp backend (CPU-native GGUF)
 
-Recommended pairing: `lightweight` or `minimal` tier.
+Recommended pairing: `lightweight` or `minimal` tier on CPU. The `heavy` tier (DeepSeek-Coder-V2-Lite, Q4_K_M GGUF) also runs here on a GPU with partial offload (24 layers on a 12 GB card); on Kubernetes the chart handles download, GPU access and startup budget (see the Helm section).
 
 ```bash
 # 1. Download the GGUF model
@@ -252,6 +252,48 @@ GRAPH_CO_CHANGE_COMMITS=200 docker compose -f docker-compose.yml -f docker-compo
 
 ---
 
+<!-- docs-update:helm-0.2.0 -->
+#### Human-in-the-loop review
+
+Two review points, both optional (`HITL_ENABLED`, `OUTPUT_REVIEW_MODE`, and live toggles in the Configuration panel):
+
+- **Tool-plan review** (before any tool runs). The reviewer can **approve**, **modify** the plan, or reject it in one of three ways: **end** the question, **re-plan**, or **re-plan with feedback** (the reviewer's note is passed to the planner). Re-planning is capped by `MAX_REPLANS` (default `3`) so a plan/reject loop cannot run forever.
+- **Output review** (after generation). Accept, regenerate, or add context, plus a 1–5 satisfaction score and format notes.
+
+Every decision is logged on the question's MLflow run (see [Observability](#observability-mlflow)).
+
+#### Saving a conversation
+
+The **💾 Save conversation** button in the sidebar downloads the whole conversation as a Markdown transcript: thread id, repositories in scope, the resolved model, every message, the indexing result for each repository and, under each answer, its pipeline trace (including ⚠️ warnings). Nothing else persists a conversation in a directly usable form; MLflow keeps each question's response and `result.json` per run.
+
+#### Automatic deployment defaults
+
+With `INFERENCE_BACKEND=auto` (the default in `docker-compose.dev.yml` and allowed in Helm) the app asks the stack what is running instead of needing variables set by hand (`src/deployment.py`):
+
+1. llama-server reachable at `LLAMACPP_HOST` → backend `llamacpp`, model = what the server reports, tier inferred from that model name.
+2. else vLLM reachable at `VLLM_HOST` → `vllm`.
+3. else → `ollama`.
+
+The check repeats every few seconds, so a llama-server that starts after the app is picked up without a restart. Setting `INFERENCE_BACKEND` to a concrete value pins the backend (the Helm chart always does). The "(container default: …)" labels in the Model panel show the resolved values; the **Last resolved model** box shows what actually answered.
+
+#### Environment reference (dev additions)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `INFERENCE_BACKEND` | `auto` (dev compose) | `auto`, `ollama`, `vllm`, `llamacpp` |
+| `MODEL_TIER` | `full` | `heavy`, `full`, `balanced`, `lightweight`, `minimal`; only used when the tier cannot be inferred from the running model |
+| `LLAMACPP_HOST` / `LLAMACPP_MODEL` | `http://localhost:8081` / tier default | llama-server endpoint; the model name is only a fallback, the app reads the real one from the server |
+| `EMBED_NUM_GPU` | `0` | Where the Ollama embedding model runs: `0` = CPU, `-1` = Ollama decides. See the note under llama.cpp on a 12 GB GPU below |
+| `MAX_REPLANS` | `3` | Cap on tool-plan re-plans per question |
+| `MLFLOW_TRACKING_URI` | unset (tracking off) | Where runs are logged |
+| `MLFLOW_EXPERIMENT` | `code-doc-assistant-dev` | Experiment name |
+| `MLFLOW_UI_URL` | `http://localhost:5000` | Browser-reachable MLflow URL, only used for links in the UI |
+| `EVAL_GROUP` | unset | Stored as tag `eval.group` to group the runs of one evaluation batch |
+
+> **Embedding placement matters on a 12 GB GPU.** With the heavy tier resident (~11.6 of 12.2 GB VRAM), one Ollama embedding call on the GPU dropped llama-server from 132–177 tok/s to under 7 tok/s until it was restarted. The same call on CPU left speed untouched, so embeddings default to CPU (`EMBED_NUM_GPU=0`). Results do not depend on placement, only latency does.
+
+---
+
 ### Helm / Kubernetes
 
 #### `master` branch
@@ -269,44 +311,121 @@ helm install code-doc-assistant ./helm/code-doc-assistant \
   --set embeddingModel=lightweight
 ```
 
-#### `dev` branch
+#### `dev` branch (chart 0.2.0)
+
+The chart mirrors the compose stack: app, ChromaDB, MLflow, Ollama (embeddings, and the chat model when Ollama answers), and optionally llama.cpp or vLLM.
 
 ```bash
 # Default (full + q4_K_M + ollama + local)
-helm install code-doc-assistant ./helm/code-doc-assistant
+helm install cda ./helm/code-doc-assistant
 
-# Minimal + llamacpp
-helm install code-doc-assistant ./helm/code-doc-assistant \
-  --set modelTier=minimal \
-  --set inferenceBackend=llamacpp
+# Heavy tier on llama.cpp with a GPU (see "llama.cpp on Kubernetes" below)
+helm install cda ./helm/code-doc-assistant \
+  --set inferenceBackend=llamacpp --set modelTier=heavy \
+  --set llamacpp.download.enabled=true
+
+# Minimal + llamacpp (CPU)
+helm install cda ./helm/code-doc-assistant \
+  --set modelTier=minimal --set inferenceBackend=llamacpp \
+  --set llamacpp.gpu.enabled=false
 
 # Balanced + q8_0 + cluster profile
-helm install code-doc-assistant ./helm/code-doc-assistant \
-  --set modelTier=balanced \
-  --set quantisation=q8_0 \
-  --set deploymentTarget=cluster
+helm install cda ./helm/code-doc-assistant \
+  --set modelTier=balanced --set quantisation=q8_0 --set deploymentTarget=cluster
 
 # vLLM backend (GPU node required)
-helm install code-doc-assistant ./helm/code-doc-assistant \
-  --set inferenceBackend=vllm \
-  --set modelTier=full
+helm install cda ./helm/code-doc-assistant \
+  --set inferenceBackend=vllm --set modelTier=full
 ```
+
+Notes on how backends are wired:
+
+- `inferenceBackend` accepts `auto`, `ollama`, `vllm`, `llamacpp`. `llamacpp.enabled` / `vllm.enabled` deploy a backend **next to** Ollama (useful for backend comparisons) without changing which one the app is pinned to.
+- The Ollama pod only pulls the chat model when Ollama may actually answer (`ollama.pullLlm` overrides); otherwise it pulls just the embedding model.
+- App environment is generated from values: `INFERENCE_BACKEND`, `LLAMACPP_HOST`, `LLAMACPP_MODEL`, `EMBED_NUM_GPU`, `MAX_REPLANS`, `MLFLOW_*`, `EVAL_GROUP` (see the environment table above). Values: `embedNumGpu`, `maxReplans`, `evalGroup`, `mlflow.{enabled,experiment,uiUrl,allowedHosts,resources}`.
+
+#### llama.cpp on Kubernetes
+
+Rendered as its own Deployment (`/app/llama-server`, `Recreate` strategy because a GPU model cannot be loaded twice), a Service, and a models volume. Tier defaults mirror compose and can be overridden:
+
+| Tier | GGUF file (in `/models`) | ctx | GPU layers |
+|------|--------------------------|-----|-----------|
+| `heavy` | `deepseek-coder-v2-lite-instruct-q4_k_m.gguf` | 4096 | 24 |
+| `full` | `mistral-nemo-instruct-2407-q4_k_m.gguf` | 8192 | 999 |
+| `minimal` | `qwen2.5-coder-3b-instruct-q4_k_m.gguf` | 2048 | 999 |
+
+Other tiers fail at render time with "set `llamacpp.modelFile`", rather than guessing a file. Override with `llamacpp.modelFile`, `servedModelName`, `contextSize`, `gpuLayers`, `threads`, `extraArgs` (for example `--n-cpu-moe` or `--flash-attn` experiments).
+
+**Getting the model in.** llama-server does not pull models. Either set `llamacpp.download.enabled=true` (an init container downloads the file once, heavy and full tiers have built-in URLs; any other file needs `llamacpp.download.url`), or provide it yourself with `llamacpp.models.hostPath`, `llamacpp.models.existingClaim`, or the default PVC (`llamacpp.models.persistence`).
+
+**Startup budget.** The first load of the 10 GB heavy model took about 15 minutes on minikube (cold read), and about 3.5 minutes once the file was in the page cache. The pod is killed if `/health` is not up within `10 s × llamacpp.startupFailureThreshold`; the default is `180` (30 minutes). Raise it for slower storage.
+
+**GPU modes** (`llamacpp.gpu.*`):
+
+| Setting | Use when |
+|---------|----------|
+| `mode: resource` (default) | Standard GPU nodes with the NVIDIA device plugin: requests `nvidia.com/gpu: 1` |
+| `mode: runtime` (+ `runtimeClassName` if the cluster needs one) | The container runtime injects the GPU (`NVIDIA_VISIBLE_DEVICES=all`), no device plugin or resource request |
+| `wsl2: true` | Windows + WSL2 + Docker/minikube, see below. Implies runtime mode and mounts `libdxcore.so` from the node |
+| `enabled: false` | CPU only |
+
+#### Local cluster on Windows + WSL2 + minikube (GPU)
+
+Verified on an RTX 5070 Ti laptop (12 GB). WSL2 exposes the GPU through a paravirtualised device (`/dev/dxg`) rather than normal NVIDIA device nodes, which breaks the usual Kubernetes GPU path in two places: Docker Desktop's built-in kind cluster cannot expose a GPU at all, and the NVIDIA device plugin fails NVML initialisation ("Not Supported"). Nested containers also do not receive `libdxcore.so`, which is what `llamacpp.gpu.wsl2` mounts. On a normal Linux GPU node none of this applies; use the default `resource` mode.
+
+```bash
+# 1. Cluster whose node container can see the GPU. WSL had ~11 GB here, so keep --memory below that.
+minikube start --driver=docker --container-runtime=docker --gpus=all --cpus=8 --memory=9g
+
+# 2. Build the app image and hand it to the cluster (there is no src/ bind mount on k8s:
+#    rebuild and re-load after every change to src/)
+docker build -t code-doc-assistant:latest .
+minikube image load code-doc-assistant:latest
+
+# 3. Install with the preset (heavy tier on llama.cpp, GPU, WSL2 mount, NodePorts 30501 / 30500).
+#    First start downloads ~10 GB, then loads it (allow 15-20 min).
+helm upgrade --install cda ./helm/code-doc-assistant -n code-doc --create-namespace \
+  -f helm/code-doc-assistant/values-wsl2-minikube.yaml
+
+# 4. Watch it come up
+kubectl -n code-doc get pods -w
+```
+
+Use the preset on every upgrade and avoid `--reuse-values`, which keeps the previous release's values and hides changes in the files. For a new app image use a new tag each time (`--set app.image.tag=dev-2`, then `dev-3` ...): `minikube image rm` fails while a container still uses the old image.
+
+**Stable access ports (no port-forward).** The preset exposes the app and MLflow as NodePorts (30501 / 30500), but with the docker driver the node is a container on a Docker-internal network, so they are not reachable from the Windows browser. Two small proxy containers on that network give fixed local ports; Docker restarts them, so they survive pod replacements, `helm upgrade` and reboots:
+
+```bash
+docker run -d --name cda-ui     --restart unless-stopped --network minikube -p 8501:8501 \
+  alpine/socat tcp-listen:8501,fork,reuseaddr tcp:minikube:30501
+docker run -d --name cda-mlflow --restart unless-stopped --network minikube -p 5000:5000 \
+  alpine/socat tcp-listen:5000,fork,reuseaddr tcp:minikube:30500
+```
+
+Then use `http://localhost:8501` (app) and `http://localhost:5000` (MLflow). `minikube` here is both the Docker network and the node container's name, so the node IP does not matter. Remove with `docker rm -f cda-ui cda-mlflow`. (`minikube service <name> -n code-doc --url` also works, but needs a terminal kept open and prints a new port each time.)
+
+Things that cost time and are worth knowing:
+
+- **`:Zone.Identifier` files.** Files downloaded through Windows leave `<file>:Zone.Identifier` siblings in WSL that Helm rejects (invalid template extension / control characters). Before every helm command: `find helm -name '*:Zone.Identifier' -print -delete`. They are in `.gitignore`.
+- **`ImagePullBackOff` on the app pod** means the image was not loaded into the cluster (step 2).
+- **A dead port-forward** can keep holding the port while connections fail (`curl` prints `000`), and `kubectl port-forward` dies whenever its pod is replaced. Prefer the proxy containers above; if you do use port-forward, kill the old one first.
+- **Python files in `helm/.../templates/`** break `helm upgrade` (everything in that folder is parsed as a template). Keep only the chart's `.yaml` / `.tpl` files there.
+- Check the GPU is really used: `nvidia-smi` in WSL should show several GB held by `llama-server`.
 
 #### Access
 
 ```bash
-# Single developer (port-forward)
-kubectl port-forward svc/code-doc-assistant-app 8501:8501
+# Single developer (port-forward); service names are <release>-code-doc-assistant-<component>
+kubectl port-forward svc/cda-code-doc-assistant-app 8501:8501
 
-# Team on private network (NodePort)
-helm install code-doc-assistant ./helm/code-doc-assistant \
-  --set app.service.type=NodePort \
-  --set app.service.nodePort=30501
+# Team on private network (NodePort); MLflow has the same options (mlflow.service.type / nodePort)
+helm install cda ./helm/code-doc-assistant \
+  --set app.service.type=NodePort --set app.service.nodePort=30501 \
+  --set mlflow.service.type=NodePort --set mlflow.service.nodePort=30500
 
 # Production (Ingress + TLS)
-helm install code-doc-assistant ./helm/code-doc-assistant \
-  --set ingress.enabled=true \
-  --set ingress.hosts[0].host=docs.internal.example.com
+helm install cda ./helm/code-doc-assistant \
+  --set ingress.enabled=true --set ingress.hosts[0].host=docs.internal.example.com
 ```
 
 ---
@@ -316,8 +435,9 @@ helm install code-doc-assistant ./helm/code-doc-assistant \
 ```mermaid
 flowchart LR
     subgraph TIERS["Model Tier — capability selector"]
+        HEAVY["heavy (opt-in)\ndeepseek-coder-v2:16b-lite\n~13Gi VRAM q4\nctx 8192"]
         FULL["full\nmistral-nemo:12b\n~8Gi VRAM q4\nctx 8192"]
-        BAL["balanced\ndeepseek-coder-v2:16b-lite\n~6Gi VRAM q4\nctx 8192"]
+        BAL["balanced\nqwen2.5-coder:7b\n~4.5Gi VRAM\nctx 8192"]
         LIGHT["lightweight\nphi3.5\n~4Gi VRAM\nctx 4096"]
         MIN["minimal\nqwen2.5-coder:3b\n~2Gi VRAM\nctx 2048"]
     end
@@ -328,14 +448,15 @@ flowchart LR
         FP["fp16\nfull precision"]
     end
 
-    FULL & BAL -->|suffix appended| QUANT
-    LIGHT & MIN -->|built-in Q4\nno suffix| SKIP["Ollama/llama.cpp\ndefault quantisation"]
+    HEAVY & FULL -->|suffix appended| QUANT
+    BAL & LIGHT & MIN -->|bare tag\nno suffix| SKIP["Ollama/llama.cpp\ndefault quantisation"]
 ```
 
 | Tier | Model | Chunking | Backend affinity |
 |------|-------|----------|-----------------|
+| `heavy` | deepseek-coder-v2:16b-lite-instruct (opt-in; MoE, VRAM follows *total* params) | AST | ollama / llamacpp (GPU) / vllm |
 | `full` | mistral-nemo:12b-instruct | AST | ollama / vllm |
-| `balanced` | deepseek-coder-v2:16b-lite-instruct | AST | ollama / vllm |
+| `balanced` | qwen2.5-coder:7b | AST | ollama / vllm |
 | `lightweight` | phi3.5 | text | ollama / llamacpp |
 | `minimal` | qwen2.5-coder:3b-instruct | text | llamacpp (recommended) |
 
@@ -351,7 +472,7 @@ flowchart LR
         LC["llama-server\nCPU-native GGUF\nOpenAI-compatible API\nlowest overhead"]
     end
 
-    FULL["full / balanced"] --> OL & VL
+    FULL["heavy / full / balanced"] --> OL & VL & LC
     LIGHT["lightweight / minimal"] --> OL & LC
 ```
 
@@ -359,30 +480,51 @@ flowchart LR
 |---------|---------|-----|----------|
 | `ollama` | default | Ollama REST | All tiers; development; model management |
 | `vllm` | `--profile vllm` | OpenAI-compatible | full/balanced on GPU; high-throughput |
-| `llamacpp` | `--profile llamacpp` | OpenAI-compatible | lightweight/minimal on CPU; maximum control over GGUF |
+| `llamacpp` | `--profile llamacpp` (Helm: `llamacpp.enabled`) | OpenAI-compatible | lightweight/minimal on CPU; heavy tier on GPU with partial layer offload; maximum control over GGUF |
 
 ---
 
+<!-- docs-update:mlflow-per-question -->
 ## Observability (MLflow)
 
-MLflow is a **system-level observability layer** — it tracks the agent pipeline as a whole, independently of which inference backend, model tier, or deployment configuration is active.
+MLflow is a **system-level observability layer**: it tracks the agent pipeline as a whole, independently of which inference backend, model tier or deployment is active.
+
+**One run per question.** Every question the user asks creates exactly one MLflow run, from the moment it is asked until it is answered, rejected or fails, however many human-review pauses and re-plans happen in between (`src/tracking.py`). The Streamlit UI advances the graph one node per script rerun, and MLflow's "active run" is per thread, so the run is kept open on the server and re-activated around each node; node-level logging therefore lands on the right run instead of opening stray ones.
 
 ```mermaid
 flowchart LR
-    subgraph SYSTEM["System (any backend, any tier)"]
-        AGENT["Agent run"]
-        INGEST["Ingestion run"]
-    end
-
-    MLFLOW[("MLflow\nTracking Server\n:5000")]
-
-    AGENT -->|"backend · model · HITL decisions\ntool calls · retrieval confidence\nquality gate scores · latency\nuser satisfaction · run_id"| MLFLOW
-    INGEST -->|"commit SHA · embedding model\nchunk count · collection name\ngraph build status"| MLFLOW
+    Q["question"] --> START["start_query_run\nruntime params rt.*, settings, tags"]
+    START --> NODES["every graph node runs inside\ntracking.activate(run_id)"]
+    NODES --> FIN["finish_run\noutcome · metrics · result.json"]
+    NODES -. "HITL pauses, re-plans" .-> NODES
+    FIN --> MLFLOW[("MLflow\n:5000")]
 ```
 
-Every agent run logs: inference backend, resolved model name, HITL decisions (accept / regenerate / add context), tool calls executed, retrieval confidence scores, quality gate scores, user satisfaction rating (1–5), generation latency, and MLflow run ID. Every ingestion run logs: commit SHA, embedding model, chunk count, collection name, graph build status.
+What a run carries: the resolved runtime (`rt.backend`, model, tier), session settings, human-review decisions (tool plan approve / modify / re-plan / reject, output accept / regenerate / add context, satisfaction 1-5), tool calls, retrieval confidence, quality-gate scores, latency, the outcome, and a `result.json` artifact. Runs of one evaluation batch can be grouped with `EVAL_GROUP` (tag `eval.group`). Ingestion runs log commit SHA, embedding model, chunk count, collection name and graph build status.
 
-This makes MLflow run IDs traceable links between code versions, embedding indexes, and the preference data accumulated from HITL — directly relevant for the DPO training pipeline in the `orchestrated` research branch.
+Where to look: **http://localhost:5000 → Model training → Runs** (the UI shows a link to the question's run).
+
+Failure behaviour: tracking never blocks an answer. If MLflow is unreachable or not installed, it turns itself into a no-op with a single warning in the log, and calls fail fast instead of retrying for minutes.
+
+Operational notes:
+
+- The MLflow server **refuses requests whose Host header is not on its allow-list** (HTTP 403, easy to miss). Compose passes `--allowed-hosts` for `mlflow:5000`; the Helm chart generates it from the in-cluster Service names plus `localhost` and `mlflow.allowedHosts`, and the probes pin `Host: localhost:<port>`.
+- On Kubernetes give MLflow room: the previous hard-coded 512Mi limit got the pod OOM-killed with the current image. Resources are now `mlflow.resources` (none on `deploymentTarget: local`).
+- Per-node / per-LLM-call traces (MLflow GenAI traces) are not enabled; see `future_directions.md`.
+
+This makes run IDs traceable links between code versions, embedding indexes and the preference data accumulated from human review, and is the basis for comparing backends and models on the same questions.
+
+### Failure awareness (silent errors)
+
+A pipeline can look healthy while retrieval is silently empty, for example when the embedding model is missing from Ollama: indexing stores 0 chunks, the model then answers "no specific information" and nothing turns red. The app now surfaces this instead:
+
+- **Before indexing** the embedding model is checked; a failure stops the question with the reason and the `ollama pull` command.
+- **After retrieval**, if nothing was found, generation is skipped and the answer says so, with the chunk count per collection. The trace shows ⚠️ warnings and MLflow records `outcome=no_retrieval`.
+- Context assembly flags a retrieval where more than 30% of the chunks did not fit the model's window (`CONTEXT_DROP_WARN_FRACTION`) with a ⚠️.
+- The **Ollama init container** (Helm) waits for the server, retries the pull and fails the pod if the embedding model is not present, instead of reporting success.
+- Indexing results and each answer's **Pipeline trace** stay visible in the chat after the run.
+
+If you see a ⚠️ in the trace or an "Indexing failed" message, check `kubectl -n <ns> logs <ollama-pod> -c model-pull` (or `docker compose logs ollama`) first. The first index of a repo is slow (embeddings run on the Ollama CPU); follow `Generating embeddings x/N` in the app log.
 
 ---
 
@@ -454,7 +596,7 @@ MODEL_TIER=minimal INFERENCE_BACKEND=llamacpp DEPLOYMENT_TARGET=local \
   python test_pipeline.py
 ```
 
-**62 tests** across 9 classes. No Ollama, ChromaDB server, MLflow, or Kuzu server required — all run in-process.
+`test_pipeline.py` has 9 test classes (the original 62 tests); the dev stack also has app-flow and deployment-detection tests and chart render tests (backend wiring, tier defaults, probe budgets, GPU modes, MLflow flags). No Ollama, ChromaDB server, MLflow, Kuzu server or cluster required: all run in-process.
 
 ---
 
@@ -497,7 +639,7 @@ For a code documentation tool, keeping code local is a real-world requirement fo
 
 ---
 
-*For the full phase-by-phase design rationale — including the agent graph design, tool registry, inference backend factory, MLflow, Argo Workflows, the RLHF preference-learning pipeline, Helm deployment knobs, MCP integration, the graph database, and testing infrastructure (18 phases in total) — see [ARCHITECTURE.md](./ARCHITECTURE.md). For the multi-repo port done afterward and the failure modes hit getting it working end-to-end, see [DEBUGGING_JOURNEY.md](./DEBUGGING_JOURNEY.md), organised by layer (config vs. execution seam) rather than chronologically.*
+*For the full phase-by-phase design rationale — including the agent graph design, tool registry, inference backend factory, MLflow, Argo Workflows, the RLHF preference-learning pipeline, Helm deployment knobs, MCP integration, the graph database, and testing infrastructure, the `balanced`/`heavy` tier correction, per-question MLflow runs and the Helm 0.2.0 / GPU-on-Kubernetes work and the silent-failure handling (22 phases in total) — see [ARCHITECTURE.md](./ARCHITECTURE.md). For the multi-repo port done afterward and the failure modes hit getting it working end-to-end, see [DEBUGGING_JOURNEY.md](./DEBUGGING_JOURNEY.md), organised by layer (config vs. execution seam) rather than chronologically.*
 
 ## Roadmap
 
@@ -527,5 +669,5 @@ In a production environment with known GPU topology: vLLM continuous batching + 
 - **Modular design**: each source file maps to a single concern
 - **Abstraction layers**: vector store interface; tool registry split (local/MCP)
 - **Configuration**: environment-variable driven, full parity between Docker Compose and Helm
-- **Testing**: 62 unit tests, no external services, covers all new components
+- **Testing**: unit, app-flow, deployment-detection and chart-render tests, no external services
 - **Observability**: MLflow for system-level experiment tracking; structured logging; configurable log level

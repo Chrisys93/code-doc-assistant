@@ -51,7 +51,9 @@ which cascades from Helm values.yaml → _helpers.tpl → app container env → 
 
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import os
 import time
 from typing import Any, Literal, Optional
@@ -63,11 +65,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
 
+logger = logging.getLogger(__name__)
+
 from agent_state import (
     AgentState, Chunk, HITLCheckpoint, PostGenerationFeedback,
     SessionPreferences, SupervisorAdjustment, ToolCall
 )
 from tools import build_tool_registry, run_tool
+import tracking
+import deployment
 
 # ---------------------------------------------------------------------------
 # Configuration from environment
@@ -90,13 +96,21 @@ HITL_ENABLED = os.environ.get("HITL_ENABLED", "true").lower() == "true"
 #            llama-server exposes the same /v1/chat/completions API as vLLM;
 #            we reuse ChatOpenAI pointed at LLAMACPP_HOST.
 #
-INFERENCE_BACKEND = os.environ.get("INFERENCE_BACKEND", "ollama").lower()
+# "auto" (the dev-compose default) means: follow what the stack is actually running -- see deployment.py.
+INFERENCE_BACKEND = os.environ.get("INFERENCE_BACKEND", "auto").lower()
+
+
+def _default_backend() -> str:
+    """The deployment's backend: INFERENCE_BACKEND if it names one, otherwise whatever is running."""
+    return deployment.backend()
 VLLM_HOST = os.environ.get("VLLM_HOST", "http://localhost:8080")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", os.environ.get("OLLAMA_MODEL", "mistral-nemo"))
 LLAMACPP_HOST = os.environ.get("LLAMACPP_HOST", "http://localhost:8081")
-# LLAMACPP_MODEL is the --served-model-name passed to llama-server,
-# or GGUF filename stem if no alias is set. Defaults to minimal tier model.
-LLAMACPP_MODEL = os.environ.get("LLAMACPP_MODEL", "qwen2.5-coder-3b-instruct-q4_k_m")
+# LLAMACPP_MODEL is only the FALLBACK name, used when llama-server cannot be asked.
+# The name actually used (and logged) comes from the server's own /v1/models -- see
+# _llamacpp_served_model() -- because llama-server serves whichever GGUF it was launched
+# with (its -a alias, or the GGUF filename stem) and ignores the request's `model` field.
+LLAMACPP_MODEL = os.environ.get("LLAMACPP_MODEL", "mistral-nemo-instruct-2407-q4_k_m")
 
 # Output review mode — controls post-generation quality gate behaviour.
 # "human"      → HITL-2: interrupt and wait for human rating + decision
@@ -111,6 +125,8 @@ OUTPUT_REVIEW_MODE: Literal["human", "supervisor", "self", "off"] = (
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.45"))
 MAX_RETRIEVAL_ATTEMPTS = int(os.environ.get("MAX_RETRIEVAL_ATTEMPTS", "3"))
 MAX_GENERATION_ATTEMPTS = int(os.environ.get("MAX_GENERATION_ATTEMPTS", "3"))
+# How many times a reviewer may send the tool plan back for re-planning before the run ends.
+MAX_REPLANS = int(os.environ.get("MAX_REPLANS", "3"))
 
 # Supervisor quality-gate rubric score below which output is rejected (0–10)
 QUALITY_GATE_THRESHOLD = float(os.environ.get("QUALITY_GATE_THRESHOLD", "6.0"))
@@ -119,9 +135,299 @@ QUALITY_GATE_THRESHOLD = float(os.environ.get("QUALITY_GATE_THRESHOLD", "6.0"))
 # LLM client — backend-agnostic factory
 # ---------------------------------------------------------------------------
 
-def _get_llm(temperature: float = 0.1):
+# Model tier -> base model name, mirrors config.py / _helpers.tpl resolution.
+# Lets a runtime tier override (from the UI dropdown) resolve to a concrete
+# model tag without a container restart.
+#
+# "heavy" is explicit and opt-in: deepseek-coder-v2:16b-lite-instruct is a
+# genuinely strong choice for polyglot codebases (MoE, good multi-language
+# reasoning), but its MoE VRAM footprint is dominated by TOTAL parameters
+# (16B), not active parameters (~2.4B/token) — it needs ~13GB regardless of
+# "lite" compute cost, which does NOT fit a 12GB card alongside context and
+# silently falls back to partial CPU inference (see ARCHITECTURE.md Phase 19
+# for the full incident writeup). It briefly occupied "balanced" by mistake;
+# it now has its own clearly-labelled slot instead, above "full", for anyone
+# with the VRAM headroom (16GB+) to actually run it entirely on GPU.
+_MODEL_TIER_BASE = {
+    "heavy":       "deepseek-coder-v2:16b-lite-instruct",
+    "full":        "mistral-nemo:12b-instruct",
+    "balanced":    "qwen2.5-coder:7b",
+    "lightweight": "phi3.5",
+    "minimal":     "qwen2.5-coder:3b-instruct",
+}
+
+
+# Context window per tier, mirrors _helpers.tpl's inferenceConfig helper.
+# NOTE: this was previously only emitted as an env var for the Helm chart
+# and never actually consumed anywhere in this file — ChatOllama() ran on
+# Ollama's small built-in default (2048) regardless of tier or model. That
+# was invisible with mistral-nemo + short single-repo prompts; it surfaces
+# immediately with a bigger model + a fair-merged multi-repo context that
+# no longer fits in 2048 tokens. Wired in properly below.
+_MODEL_TIER_CTX = {
+    "heavy":       8192,
+    "full":        8192,
+    "balanced":    8192,
+    "lightweight": 4096,
+    "minimal":     2048,
+}
+
+# Fallback for the container's own default tier (no hot-swap override),
+# read once at import — OLLAMA_NUM_CTX env var wins if explicitly set,
+# otherwise derived from MODEL_TIER the same way OLLAMA_MODEL already is.
+OLLAMA_NUM_CTX = int(os.environ.get(
+    "OLLAMA_NUM_CTX",
+    str(_MODEL_TIER_CTX.get(os.environ.get("MODEL_TIER", "full"), 8192)),
+))
+
+
+def _llamacpp_props() -> dict | None:
+    """The running llama-server's own description of itself (GET /props), or None."""
+    try:
+        import requests
+        return requests.get(f"{LLAMACPP_HOST}/props", timeout=3).json()
+    except Exception:
+        return None
+
+
+def _llamacpp_server_ctx() -> int | None:
+    """Real per-slot context of the running llama-server (GET /props), or None.
+
+    llama-server is launched with its own --ctx-size (4096 for the heavy tier),
+    independent of _MODEL_TIER_CTX below. Budgeting retrieved context against the
+    tier table (8192) while the server holds 4096 overflows the prompt as soon as
+    retrieval returns real chunks. Asking the server removes that config coupling.
+    """
+    props = _llamacpp_props() or {}
+    n = (props.get("default_generation_settings") or {}).get("n_ctx") or props.get("n_ctx")
+    try:
+        return int(n) if n else None
+    except (TypeError, ValueError):
+        return None
+
+
+_SERVED_MODEL_CACHE: dict = {"at": 0.0, "name": None}
+
+
+def _llamacpp_served_model(max_age_s: float = 30.0) -> str | None:
+    """Model id the running llama-server actually serves (GET /v1/models), or None.
+
+    llama-server holds ONE model, chosen by its launch command, and ignores the `model`
+    field of requests. Reading the id from the server -- instead of from the app's own
+    LLAMACPP_MODEL default -- keeps the trace, the MLflow params and any comparison between
+    models honest: previously the app labelled DeepSeek answers "mistral-nemo". Cached for a
+    short time so it costs nothing per call but still follows a server that was relaunched
+    with another model.
+    """
+    now = time.time()
+    if now - _SERVED_MODEL_CACHE["at"] < max_age_s and _SERVED_MODEL_CACHE["name"]:
+        return _SERVED_MODEL_CACHE["name"]
+    name = None
+    try:
+        import requests
+        data = (requests.get(f"{LLAMACPP_HOST}/v1/models", timeout=3).json() or {}).get("data") or []
+        name = data[0].get("id") if data else None
+    except Exception:
+        name = None
+    if name:
+        _SERVED_MODEL_CACHE.update(at=now, name=name)
+    return name or _SERVED_MODEL_CACHE["name"]
+
+
+def _effective_ctx_window(state: "AgentState") -> int:
+    """Context window the answering model really has, for context budgeting."""
+    backend = (state.get("active_backend") or _default_backend() or "").lower()
+    if backend == "llamacpp":
+        n = _llamacpp_server_ctx()
+        if n:
+            return n
+    return _resolve_ctx_for_tier(state.get("active_model_tier"))
+
+
+def _resolve_ctx_for_tier(tier: str | None) -> int:
+    """Context window for a given tier; falls back to the container default."""
+    if tier:
+        return _MODEL_TIER_CTX.get(tier, OLLAMA_NUM_CTX)
+    return OLLAMA_NUM_CTX
+
+
+def _resolve_model_for_tier(tier: str, quantisation: str = "q4_K_M") -> str:
+    """Compose an Ollama-style model tag from a tier (+ quantisation), same
+    logic as config.py._resolve_ollama_model().
+
+    lightweight/minimal/balanced suppress the quant suffix — lightweight and
+    minimal already default to Q4 in Ollama; balanced's qwen2.5-coder:7b has
+    no verified compound tag (see Phase 19), so it uses its known-working
+    bare tag rather than a guessed one.
+
+    heavy KEEPS quant composition — deepseek-coder-v2:16b-lite-instruct-q4_K_M
+    was empirically confirmed to exist and pull successfully during this
+    session's testing (visible in `ollama ps` output), so composing the
+    suffix here is safe, unlike the balanced case above."""
+    base = _MODEL_TIER_BASE.get(tier, _MODEL_TIER_BASE["full"])
+    if tier in ("lightweight", "minimal", "balanced") or quantisation == "fp16":
+        return base
+    return f"{base}-{quantisation}"
+
+
+# Resident-model budget: how many distinct Ollama models we're willing to
+# keep warm at once. Today, single GPU, this is 1 — meaning hot-swap always
+# fully replaces whatever was resident (current behaviour, unchanged).
+#
+# The hook for later: bump OLLAMA_MAX_RESIDENT_MODELS once there's more than
+# one GPU (or enough VRAM to genuinely hold multiple models), and the SAME
+# code below automatically becomes LRU eviction instead of full replacement
+# — keep the N most-recently-used models resident, only evict the rest.
+# No code change needed at that point, just the env var (and presumably
+# Ollama's own OLLAMA_MAX_LOADED_MODELS server-side setting, which this is
+# deliberately meant to track rather than duplicate/fight).
+OLLAMA_MAX_RESIDENT_MODELS = int(os.environ.get("OLLAMA_MAX_RESIDENT_MODELS", "1"))
+
+
+def _unload_other_ollama_models(keep_model: str, host: str) -> None:
+    """
+    Free up Ollama-resident model slots for keep_model, respecting
+    OLLAMA_MAX_RESIDENT_MODELS.
+
+    budget=1 (default, single-GPU today): every OTHER resident model is
+      unloaded — hot-swap fully replaces what's warm. This is today's
+      behaviour and needs no multi-GPU awareness to be correct.
+
+    budget>1 (future, multi-GPU/more VRAM): keeps the (budget - 1)
+      most-recently-used OTHER models resident alongside keep_model and
+      only evicts the least-recently-used beyond that — true concurrent
+      multi-model access rather than replacement. Recency is taken from
+      Ollama's own `expires_at` on each /api/ps entry (it resets on every
+      use of that model), so no separate LRU tracking is needed here.
+
+    Ollama keeps a loaded model resident for its keep_alive window (default
+    5 minutes idle) after each request. Without this, every tier you've
+    tried this session stays resident, competing for the same GPU/RAM,
+    until it happens to idle out on its own.
+
+    Set OLLAMA_AUTO_UNLOAD=false to disable this entirely.
+    Best-effort: any failure here is logged and swallowed — this is a
+    memory optimisation, not something that should block a generation
+    request that would otherwise succeed.
+    """
+    if os.environ.get("OLLAMA_AUTO_UNLOAD", "true").lower() != "true":
+        return
+    try:
+        import ollama
+        client = ollama.Client(host=host)
+        running = client.ps().get("models", [])
+        others = [m for m in running if (m.get("model") or m.get("name")) != keep_model]
+        if not others:
+            return
+
+        budget_for_others = max(OLLAMA_MAX_RESIDENT_MODELS - 1, 0)
+        if budget_for_others > 0:
+            # Multi-model path: keep the most-recently-used `budget_for_others`
+            # others resident, evict the rest. expires_at is reset by Ollama on
+            # every use, so sorting by it descending approximates true LRU order.
+            others.sort(key=lambda m: m.get("expires_at") or "", reverse=True)
+            to_unload = others[budget_for_others:]
+        else:
+            # budget=1 path (today): unload everything that isn't keep_model.
+            to_unload = others
+
+        for m in to_unload:
+            tag = m.get("model") or m.get("name")
+            if not tag:
+                continue
+            logger.info(f"Unloading idle Ollama model {tag!r} to free memory for {keep_model!r}")
+            try:
+                # keep_alive=0 tells Ollama to unload immediately after this
+                # (empty, no-op) request rather than waiting out its idle timeout.
+                client.generate(model=tag, prompt="", keep_alive=0)
+            except Exception as ue:
+                logger.warning(f"Could not unload {tag!r}: {ue}")
+    except Exception as e:
+        logger.warning(f"Could not query/unload running Ollama models (non-fatal): {e}")
+
+
+def _ensure_ollama_model_available(model: str, host: str) -> None:
+    """
+    Check whether `model` is already pulled on the Ollama server at `host`;
+    if not, pull it now (blocking).
+
+    This is what makes runtime model hot-swapping actually work end-to-end.
+    Picking a new tier/backend in the dropdown resolves a new model TAG
+    immediately (that part always worked), but Ollama still needs that exact
+    tag physically pulled before it can serve a request for it. Without this
+    check, the first request after a hot-swap fails deep inside
+    langchain_ollama with a raw 404 "model not found" — which is exactly
+    what surfaced once the error-persistence fix made it visible.
+
+    Only called from the Ollama branch of _get_llm(), and only when a
+    runtime override was actually supplied (see call site) — the normal,
+    no-override path (container's own default model, pulled once at
+    startup by ollama-bootstrap) incurs no extra API call or latency.
+    """
+    try:
+        import ollama
+        client = ollama.Client(host=host)
+        existing = set()
+        for m in client.list().get("models", []):
+            tag = m.get("model") or m.get("name")
+            if tag:
+                existing.add(tag)
+        if model in existing:
+            return
+        logger.info(
+            f"Model {model!r} not found on Ollama host {host} — pulling now "
+            f"(first use of this tag can take a few minutes)..."
+        )
+        client.pull(model)
+        logger.info(f"Pull complete: {model!r}")
+    except Exception as e:
+        # Re-raise as a clear, actionable message rather than letting the
+        # underlying ollama/list/pull exception (or the original 404) reach
+        # the caller — this is what the app's persisted error panel shows.
+        raise RuntimeError(
+            f"Model {model!r} is not available on Ollama ({host}) and could "
+            f"not be auto-pulled: {e}. Try `ollama pull {model}` manually on "
+            f"the Ollama host, or pick a different tier/backend."
+        ) from e
+
+
+def _get_llm(
+    temperature: float = 0.1,
+    backend: str | None = None,
+    model: str | None = None,
+    model_tier: str | None = None,
+):
     """
     Return a LangChain chat model pointed at the configured inference backend.
+
+    Runtime hot-swap
+    ─────────────────
+    backend / model / model_tier, when provided, override the INFERENCE_BACKEND /
+    OLLAMA_MODEL / VLLM_MODEL / LLAMACPP_MODEL env vars for this call only —
+    same live-state pattern as hitl_enabled/output_review_mode elsewhere in this
+    file: the env var is only the fallback default, resolved once at import;
+    the actual per-request value is read from AgentState (active_backend /
+    active_model_tier) via _llm_kwargs_from_state() and passed in here on every
+    node call, so a mid-conversation model change (e.g. the Streamlit dropdown)
+    takes effect without restarting the container. If model is not given but
+    model_tier is, the tag is resolved from the tier. If neither is given,
+    falls back to the env-var defaults exactly as before — fully backward
+    compatible with existing callers and tests.
+
+    Host resolution is NOT overridden — OLLAMA_HOST/VLLM_HOST/LLAMACPP_HOST stay
+    fixed per deployment; only which backend/model is targeted changes at runtime.
+
+    Hot-swap only fully works for Ollama. Ollama's API can pull an arbitrary
+    model tag on demand (see _ensure_ollama_model_available below) — the
+    first request after switching to a not-yet-pulled tag will block for a
+    few minutes while it downloads, then succeed. vLLM and llama-server are
+    each started with ONE fixed model baked into their launch command
+    (docker-compose_dev.yml `command:` args) — they cannot serve a different
+    model without the container being restarted with new args. Switching
+    the backend dropdown to vllm/llamacpp changes which server this
+    conversation talks to, but not what that server is currently running;
+    if it's serving a different model than what got resolved here, the
+    request will fail at the backend itself rather than in this file.
 
     ollama   → ChatOllama. Talks to the Ollama REST API directly.
     vllm     → ChatOpenAI pointed at vLLM's OpenAI-compatible /v1 endpoint.
@@ -137,28 +443,78 @@ def _get_llm(temperature: float = 0.1):
       ollama   → any tier               (model management included)
       vllm     → full / balanced        (GPU, high throughput)
     """
-    if INFERENCE_BACKEND == "vllm":
+    resolved_backend = (backend or _default_backend()).lower()
+
+    if resolved_backend == "vllm":
+        resolved_model = model or (
+            _resolve_model_for_tier(model_tier) if model_tier else VLLM_MODEL
+        )
         return ChatOpenAI(
             base_url=f"{VLLM_HOST}/v1",
             api_key="not-required",
-            model=VLLM_MODEL,
+            model=resolved_model,
             temperature=temperature,
             max_tokens=4096,
         )
-    if INFERENCE_BACKEND == "llamacpp":
+    if resolved_backend == "llamacpp":
+        # model_tier is deliberately ignored here (unlike the ollama branch below):
+        # llama-server is started with ONE fixed model baked into its launch
+        # command and cannot switch at runtime. _resolve_model_for_tier() would
+        # produce an Ollama-style tag (e.g. "mistral-nemo:12b-instruct-q4_K_M")
+        # that doesn't match whatever --served-model-name llama-server was
+        # actually started with -- sending that would risk a model-name
+        # mismatch against the real server. `model` (an explicit override) still
+        # works if the caller genuinely knows the served name.
+        # The served model is read from the server (/v1/models); LLAMACPP_MODEL is only the
+        # fallback when the server cannot be reached.
+        resolved_model = model or _llamacpp_served_model() or LLAMACPP_MODEL
         return ChatOpenAI(
             base_url=f"{LLAMACPP_HOST}/v1",
             api_key="not-required",
-            model=LLAMACPP_MODEL,
+            model=resolved_model,
             temperature=temperature,
-            max_tokens=2048,  # conservative default; llama-server context is GGUF-defined
+            # full tier (mistral-nemo, 8192 ctx) benefits from more generous
+            # output headroom than the old 2048 default, which was sized for
+            # the tiny minimal-tier model this used to point at.
+            max_tokens=4096,
         )
     # Default: Ollama
+    resolved_model = model or (
+        _resolve_model_for_tier(model_tier) if model_tier else OLLAMA_MODEL
+    )
+    # Only check/pull when this call came from a runtime override (backend,
+    # model, or model_tier explicitly passed) — the ordinary env-default path
+    # already has its one model pulled once at container startup by
+    # ollama-bootstrap, so skipping the check there avoids an extra API call
+    # on every single node invocation.
+    if backend or model or model_tier:
+        _unload_other_ollama_models(resolved_model, OLLAMA_HOST)
+        _ensure_ollama_model_available(resolved_model, OLLAMA_HOST)
     return ChatOllama(
         base_url=OLLAMA_HOST,
-        model=OLLAMA_MODEL,
+        model=resolved_model,
         temperature=temperature,
+        num_ctx=_resolve_ctx_for_tier(model_tier),
     )
+
+
+def _llm_kwargs_from_state(state: "AgentState") -> dict[str, Any]:
+    """
+    Extract the runtime model override (if any) from AgentState, ready to
+    unpack into _get_llm(): `_get_llm(temperature=X, **_llm_kwargs_from_state(state))`.
+    Returns {} when no override is set, giving the env-var default behaviour —
+    same pattern as `state.get("output_review_mode") or OUTPUT_REVIEW_MODE`
+    used elsewhere in this file, just as kwargs instead of an `or` fallback
+    since _get_llm needs to distinguish "unset" from "explicitly default".
+    """
+    kwargs: dict[str, Any] = {}
+    backend = state.get("active_backend")
+    tier = state.get("active_model_tier")
+    if backend:
+        kwargs["backend"] = backend
+    if tier:
+        kwargs["model_tier"] = tier
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -195,13 +551,60 @@ Example:
 """
 
 
+def _scope_vector_search_args(args: dict, active_cols: list, human_edited: bool = False) -> list[str]:
+    """
+    Normalise a vector_search call in place and return what was ignored, as readable strings.
+
+    The code, not the model, owns every argument that sets search scope or recall. A weak
+    planner mis-uses the schema in ways that each end as "no context": it puts one repo in
+    `collection_name` and the other in `collections` (silently dropping a repo), invents a
+    `filter_file` that is not a path, or guesses a `score_threshold` that excludes everything,
+    and it cannot know the internal Chroma host (it guesses "localhost:8000"). So, for a
+    planner-made plan:
+      * `collections` becomes ALL active per-repo collections;
+      * `score_threshold` and `filter_file` are dropped (config / tool defaults apply);
+      * `chroma_host` is always the real internal address.
+    This runs when the plan is PROPOSED, so the human reviewing it sees exactly what will run,
+    and the ignored planner values are returned for the trace (they are the measure of how well
+    a given model follows the tool contract).
+
+    human_edited=True means a person changed the plan in the review step: their `collections`,
+    `filter_file` and `score_threshold` are respected and only the host is forced (and
+    `collections` is filled in if left empty).
+    """
+    dropped: list[str] = []
+    if active_cols:
+        planned = args.get("collections")
+        if isinstance(planned, str):
+            planned = [x.strip() for x in planned.split(",") if x.strip()]
+        planned = list(planned or [])
+        if args.get("collection_name"):
+            planned.append(args["collection_name"])
+        if not human_edited:
+            if planned and set(planned) != set(active_cols):
+                dropped.append(f"collections={planned!r} (searching all {len(active_cols)} active)")
+            args["collections"] = list(active_cols)
+            args.pop("collection_name", None)
+        elif not planned:
+            args["collections"] = list(active_cols)
+            args.pop("collection_name", None)
+    args["chroma_host"] = CHROMA_HOST
+    if not human_edited:
+        for k in ("score_threshold", "filter_file"):
+            if k in args:
+                dropped.append(f"{k}={args.pop(k)!r}")
+    return dropped
+
+
 def node_tool_selection(state: AgentState) -> dict[str, Any]:
     """LLM proposes a tool plan for the given query."""
     # build_tool_registry() filters MCP tools by is_mcp_capable() + server enabled state,
     # so the LLM is only offered tools it can actually use.
     registry = build_tool_registry()
     tool_descs = "\n".join(
-        f"  - {name}: {meta['description']}"
+        f"  - {name}: {meta['description']}\n"
+        f"      required args: {', '.join(meta.get('required_args', [])) or '(none)'}\n"
+        f"      optional args: {', '.join(meta.get('optional_args', [])) or '(none)'}"
         for name, meta in registry.items()
     )
     system_msg = TOOL_SELECTION_SYSTEM.format(tool_descriptions=tool_descs)
@@ -211,21 +614,35 @@ def node_tool_selection(state: AgentState) -> dict[str, Any]:
     else:
         indexed_note = ""
     user_msg = f"Query: {state['query']}\nRepo path: {state['repo_path']}{indexed_note}"
+    # Re-plan: the reviewer sent the previous plan back. Show the model what was rejected and what
+    # the reviewer expected, so the new plan is different on purpose, not a re-roll.
+    replan_feedback = state.get("planner_feedback")
+    if replan_feedback is not None:
+        prev = [{"tool_name": tc.tool_name, "args": tc.args} for tc in state.get("proposed_tool_calls") or []]
+        user_msg += ("\n\nA human reviewer REJECTED this previous plan: "
+                     + json.dumps(prev, default=str)[:1500]
+                     + (f"\nWhat the reviewer expected: {replan_feedback}" if replan_feedback.strip()
+                        else "\n(No reason given - propose a meaningfully different plan.)")
+                     + "\nPropose a new plan that addresses this.")
 
-    llm = _get_llm(temperature=0.0)
+    llm = _get_llm(temperature=0.0, **_llm_kwargs_from_state(state))
     response = llm.invoke([SystemMessage(content=system_msg), HumanMessage(content=user_msg)])
 
     raw = response.content.strip()
     if raw.startswith("```"):
         raw = "\n".join(raw.split("\n")[1:-1])
 
+    planner_fell_back = False
     try:
         plan = json.loads(raw)
         tool_calls = [
             ToolCall(tool_name=tc["tool_name"], args=tc["args"])
             for tc in plan
         ]
+        if not tool_calls:
+            raise ValueError("model proposed zero tool calls")
     except Exception:
+        planner_fell_back = True
         tool_calls = [
             ToolCall(
                 tool_name="vector_search",
@@ -233,10 +650,31 @@ def node_tool_selection(state: AgentState) -> dict[str, Any]:
             )
         ]
 
+    # Normalise before anyone sees the plan (see _scope_vector_search_args): the human review
+    # step then shows what will really run, and what the planner got wrong stays in the trace.
+    ignored: list[str] = []
+    for tc in tool_calls:
+        if tc.tool_name == "vector_search":
+            ignored.extend(_scope_vector_search_args(tc.args, active_cols))
+
+    # Planner-quality signals for the model comparison: did it return a usable plan at all, and how
+    # many of its arguments did the code have to override?
+    try:
+        mlflow.log_metric("planner_json_ok", 0 if planner_fell_back else 1)
+        mlflow.log_metric("planner_ignored_args", len(ignored))
+    except Exception:
+        pass
+
     trace = list(state.get("execution_trace", []))
     trace.append({"node": "tool_selection", "status": "ok",
-                  "detail": f"proposed {len(tool_calls)} tool(s)"})
-    return {"proposed_tool_calls": tool_calls, "execution_trace": trace}
+                  "detail": f"proposed {len(tool_calls)} tool(s): " + "; ".join(
+                      f"{tc.tool_name}({json.dumps(tc.args, default=str)[:160]})"
+                      for tc in tool_calls)
+                  + (f" | ignored planner args: {', '.join(ignored)}" if ignored else "")})
+    out: dict[str, Any] = {"proposed_tool_calls": tool_calls, "execution_trace": trace}
+    if replan_feedback is not None:
+        out["planner_feedback"] = None            # consumed
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +712,7 @@ def node_hitl_checkpoint(state: AgentState) -> dict[str, Any]:
             {"tool_name": tc.tool_name, "args": tc.args}
             for tc in state["proposed_tool_calls"]
         ],
-        "message": "Review the proposed tool plan. Approve, modify, or reject.",
+        "message": "Review the proposed tool plan. Approve, modify, re-plan (with feedback), or end.",
     })
 
     decision: str = human_response.get("decision", "approved")
@@ -284,8 +722,13 @@ def node_hitl_checkpoint(state: AgentState) -> dict[str, Any]:
         approved = state["proposed_tool_calls"]
     elif decision == "modified":
         approved = [ToolCall(tool_name=tc["tool_name"], args=tc["args"]) for tc in modified_calls_raw]
-    else:  # rejected
+    else:  # "rejected" (end here) or "replan" (send back)
         approved = []
+
+    replans = state.get("replan_count") or 0
+    limit_hit = decision == "replan" and replans >= MAX_REPLANS
+    if limit_hit:
+        decision = "rejected"          # no more re-plans allowed: end instead of looping forever
 
     checkpoint = HITLCheckpoint(
         proposed_tool_calls=state["proposed_tool_calls"],
@@ -294,13 +737,26 @@ def node_hitl_checkpoint(state: AgentState) -> dict[str, Any]:
         feedback=human_response.get("feedback"),
     )
     trace = list(state.get("execution_trace", []))
-    trace.append({"node": "hitl_checkpoint", "status": "ok" if decision != "rejected" else "rejected",
-                  "detail": f"human decision: {decision}"})
-    return {"approved_tool_calls": approved, "hitl_checkpoint": checkpoint, "execution_trace": trace}
+    status = {"rejected": "rejected", "replan": "retry"}.get(decision, "ok")
+    detail = f"human decision: {decision}"
+    if decision == "replan":
+        fb = (human_response.get("feedback") or "").strip()
+        detail += f" (re-plan {replans + 1}/{MAX_REPLANS}" + (f", feedback: {fb[:120]}" if fb else ", no feedback") + ")"
+    elif limit_hit:
+        detail += f" (re-plan limit {MAX_REPLANS} reached - ending)"
+    trace.append({"node": "hitl_checkpoint", "status": status, "detail": detail})
+    out: dict[str, Any] = {"approved_tool_calls": approved, "hitl_checkpoint": checkpoint,
+                           "execution_trace": trace}
+    if decision == "replan":
+        out["planner_feedback"] = (human_response.get("feedback") or "").strip()
+        out["replan_count"] = replans + 1
+    return out
 
 
-def _route_after_hitl(state: AgentState) -> Literal["tool_execution", "__end__"]:
-    """Route to tool_execution if approved, else END."""
+def _route_after_hitl(state: AgentState) -> Literal["tool_execution", "tool_selection", "__end__"]:
+    """tool_execution if approved; back to tool_selection on a re-plan; otherwise END."""
+    if getattr(state.get("hitl_checkpoint"), "decision", None) == "replan":
+        return "tool_selection"
     if not state.get("approved_tool_calls"):
         return "__end__"
     return "tool_execution"
@@ -315,19 +771,29 @@ def node_tool_execution(state: AgentState) -> dict[str, Any]:
     approved = state.get("approved_tool_calls", [])
     executed: list[ToolCall] = []
     new_chunks: list[Chunk] = []
+    vec_calls = vec_hits = 0       # vector_search calls / chunks they returned (0 hits is a warning, not a success)
     active_cols = state.get("active_collections", [])
+    dropped_args: list[str] = []
+    human_edited = getattr(state.get("hitl_checkpoint"), "decision", None) == "modified"
 
     for tc in approved:
-        # Deterministically scope vector_search to the active per-repo collections
-        # (default: all). The model may narrow by supplying its own 'collections'.
-        if tc.tool_name == "vector_search" and active_cols and "collections" not in tc.args:
-            tc.args["collections"] = active_cols
+        # Normally a no-op: node_tool_selection already normalised the plan, so the human
+        # reviewed exactly what runs. It still guards plans that did not come from the
+        # planner, and re-applies the host. When the human EDITED the plan, their
+        # collections / filter_file / score_threshold are honoured, not overridden.
+        if tc.tool_name == "vector_search":
+            dropped_args.extend(_scope_vector_search_args(
+                tc.args, active_cols, human_edited=human_edited))
         result = run_tool(tc.tool_name, tc.args)
         tc.result = result.get("result", "") or json.dumps(result.get("chunks", []))
         tc.success = result.get("success", False)
         tc.error = result.get("error")
         tc.latency_ms = result.get("latency_ms")
         executed.append(tc)
+
+        if tc.tool_name == "vector_search":
+            vec_calls += 1
+            vec_hits += len(result.get("chunks") or [])
 
         # Convert results to Chunks
         if tc.tool_name == "vector_search" and result.get("chunks"):
@@ -340,8 +806,13 @@ def node_tool_execution(state: AgentState) -> dict[str, Any]:
                     chunk_type=c.get("chunk_type", "text"),
                     confidence=c.get("confidence", 0.0),
                 ))
-        elif tc.success and tc.result:
-            # Shell/AST tools: wrap output as a single chunk, high confidence (exact match)
+        elif tc.tool_name != "vector_search" and tc.success and tc.result:
+            # Shell/AST tools: wrap output as a single chunk, high confidence (exact match).
+            # vector_search is excluded on purpose: a search with zero hits returns no
+            # "result" text, so tc.result falls back to json.dumps([]) == "[]" -- which is
+            # truthy and used to become a fake chunk (source "codebase", confidence 1.0).
+            # That made the supervisor see perfect retrieval and the model be handed "[]"
+            # as its only context.
             source = tc.args.get("file_path", tc.args.get("path", "codebase"))
             new_chunks.append(Chunk(
                 content=tc.result,
@@ -352,8 +823,15 @@ def node_tool_execution(state: AgentState) -> dict[str, Any]:
 
     scores = [c.confidence for c in new_chunks]
     trace = list(state.get("execution_trace", []))
-    trace.append({"node": "tool_execution", "status": "ok",
-                  "detail": f"ran {len(executed)} tool(s), got {len(new_chunks)} chunk(s)"})
+    trace.append({"node": "tool_execution", "status": "warn" if (vec_calls and not vec_hits) else "ok",
+                  "detail": f"ran {len(executed)} tool(s), got {len(new_chunks)} chunk(s) -- " + "; ".join(
+                      f"{t.tool_name}:{'ok' if t.success else 'FAIL'}"
+                      + (f" collections={t.args.get('collections')}" if t.tool_name == "vector_search" else "")
+                      + (f" error={str(t.error)[:100]}" if t.error else "")
+                      for t in executed)
+                  + (f" | ignored planner args: {', '.join(dropped_args)}" if dropped_args else "")
+                  + (" | WARNING: vector_search returned 0 chunks (empty or unindexed collections?)"
+                     if vec_calls and not vec_hits else "")})
     return {
         "executed_tool_calls": executed,
         "retrieved_chunks": new_chunks,
@@ -495,12 +973,27 @@ def _route_after_supervisor(state: AgentState) -> Literal["context_assembly", "t
 
 MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8000"))
 
+CONTEXT_DROP_WARN_FRACTION = float(os.environ.get("CONTEXT_DROP_WARN_FRACTION", "0.3"))
+
+
 def node_context_assembly(state: AgentState) -> dict[str, Any]:
     """
     Deduplicate, rank by confidence, trim to context window, and
     build the final context string passed to the generation LLM.
     """
     chunks = state.get("retrieved_chunks", [])
+
+    # Trim budget must be tier-aware and leave real headroom for the system
+    # prompt (tool descriptions + instructions), the query, and the model's
+    # own response — NOT just cap at a flat MAX_CONTEXT_TOKENS regardless of
+    # the model's actual context window. Previously this used a flat 8000-token
+    # budget with no relation to num_ctx at all; that's exactly what let a
+    # fair-merged two-repo context overflow a model's real window even after
+    # num_ctx was correctly wired into _get_llm() — the retrieved-context
+    # budget alone could still exceed what's left after the system prompt.
+    # Retrieved context gets ~60% of the window; the remainder is reserved.
+    ctx_window = _effective_ctx_window(state)
+    budget_tokens = min(MAX_CONTEXT_TOKENS, int(ctx_window * 0.6))
 
     # Deduplicate by content hash, preserving arrival order.
     # IMPORTANT: do NOT re-sort by raw confidence here. retrieved_chunks already
@@ -520,24 +1013,48 @@ def node_context_assembly(state: AgentState) -> dict[str, Any]:
             unique.append(c)
 
     # Trim to context window (rough token estimate: 1 token ≈ 4 chars)
-    max_chars = MAX_CONTEXT_TOKENS * 4
+    max_chars = budget_tokens * 4
     context_parts: list[str] = []
     source_files: list[str] = []
     total_chars = 0
+    truncated = 0
 
     for c in unique:
         part = f"### {c.source_file}" + (
             f" (lines {c.start_line}–{c.end_line})" if c.start_line else ""
         ) + f"\n```\n{c.content}\n```\n"
         if total_chars + len(part) > max_chars:
-            break
+            if context_parts:
+                break
+            # The FIRST (best-ranked) chunk alone exceeds the budget. Dropping it -- and with it every
+            # later chunk -- used to leave the model with "[No relevant context found]" and no sources
+            # even though retrieval had worked. Keep its head instead.
+            part = part[:max_chars] + "\n[... truncated to fit the context budget]\n```\n"
+            truncated += 1
         context_parts.append(part)
         total_chars += len(part)
         if c.source_file not in source_files:
             source_files.append(c.source_file)
 
+    included = len(context_parts)
+    dropped = len(unique) - included
     final_context = "\n".join(context_parts) if context_parts else "[No relevant context found]"
-    return {"final_context": final_context, "source_attribution": source_files}
+    empty = included == 0
+    detail = (f"NOTHING retrieved: 0 chunks reached context assembly (generation will be skipped)" if empty else
+              f"{included}/{len(unique)} chunk(s) in context (~{total_chars // 4} of {budget_tokens} budget tokens, "
+              f"model window {ctx_window})"
+              + (f", {dropped} dropped for budget" if dropped else "")
+              + (f", {truncated} truncated" if truncated else "")
+              + f"; sources: {len(source_files)}")
+    trace = list(state.get("execution_trace", []))
+    # Transparency: a retrieval that mostly did not fit the model's window is not a clean success.
+    heavy_drop = bool(unique) and dropped / len(unique) > CONTEXT_DROP_WARN_FRACTION
+    if heavy_drop:
+        detail += (f" | WARNING: more than {int(CONTEXT_DROP_WARN_FRACTION * 100)}% of the retrieved chunks "
+                   "did not fit (small context window, or oversize chunks)")
+    trace.append({"node": "context_assembly", "status": "warn" if (empty or heavy_drop) else "ok", "detail": detail})
+    return {"final_context": final_context, "source_attribution": source_files,
+            "retrieval_empty": empty, "execution_trace": trace}
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +1091,61 @@ If the response is already good, return it unchanged.
 Respond with only the (possibly revised) documentation, no preamble."""
 
 
+def _collection_counts(cols: list[str]) -> dict[str, Optional[int]]:
+    """Chunks stored per collection (None = could not be read). Used only to explain an empty retrieval."""
+    try:
+        try:
+            from repo_index import _chroma_client
+        except ImportError:
+            from src.repo_index import _chroma_client
+        client = _chroma_client(CHROMA_HOST)
+    except Exception:
+        return {c: None for c in cols}
+    out: dict[str, Optional[int]] = {}
+    for c in cols:
+        try:
+            out[c] = client.get_collection(c).count()
+        except Exception:
+            out[c] = None
+    return out
+
+
+def _no_retrieval_response(state: AgentState) -> dict[str, Any]:
+    """Nothing was retrieved: say so, with the likely reason, instead of asking the model to answer
+    from an empty context (it replies "no specific information", which reads like a content problem
+    when the real problem is upstream: unindexed repo, missing embedding model, empty collection)."""
+    cols = state.get("active_collections") or []
+    counts = _collection_counts(cols) if cols else {}
+    known = [v for v in counts.values() if v is not None]
+    total = sum(known)
+    lines = []
+    if not cols:
+        why = "No repositories are selected for this question, so there was nothing to search."
+    elif known and total == 0:
+        why = ("The selected repositories contain **0 indexed chunks**, so there is nothing to search. "
+               "Indexing most likely failed or produced nothing: check the 📂 line under your question and the "
+               "app log, and make sure the embedding model is available in Ollama.")
+    elif known:
+        why = (f"The search ran over {total} indexed chunks but none came back. Try a more specific question "
+               "(file, function or class names), or check the retrieval settings.")
+    else:
+        why = "The index could not be read, so it is unknown whether the repositories are indexed."
+    for name, n in counts.items():
+        lines.append(f"- `{name}`: " + ("unreadable" if n is None else f"{n} chunks"))
+    response = ("**No answer was generated: nothing was retrieved for this question.**\n\n" + why
+                + ("\n\n" + "\n".join(lines) if lines else ""))
+    try:
+        mlflow.log_metric("retrieval_empty", 1)
+    except Exception:
+        pass
+    attempts = state.get("generation_attempts", 0) + 1
+    trace = list(state.get("execution_trace", []))
+    trace.append({"node": "generation", "status": "warn",
+                  "detail": "LLM call skipped: nothing was retrieved" + (f" ({total} chunks indexed)" if known else "")})
+    return {"response": response, "generation_attempts": attempts, "execution_trace": trace,
+            "total_latency_ms": 0.0}
+
+
 def node_generation(state: AgentState) -> dict[str, Any]:
     """
     Generate the final documentation/answer from the assembled context.
@@ -583,6 +1155,8 @@ def node_generation(state: AgentState) -> dict[str, Any]:
     one extra LLM call but no human latency, and catches obvious mis-scoping
     before the response reaches the user or supervisor quality gate.
     """
+    if state.get("retrieval_empty"):
+        return _no_retrieval_response(state)
     context = state.get("final_context", "[No context]")
     query = state["query"]
 
@@ -597,7 +1171,10 @@ def node_generation(state: AgentState) -> dict[str, Any]:
     ).strip()
 
     start = time.time()
-    llm = _get_llm(temperature=0.2)
+    llm_overrides = _llm_kwargs_from_state(state)
+    llm = _get_llm(temperature=0.2, **llm_overrides)
+    resolved_backend = llm_overrides.get("backend", _default_backend())
+    resolved_model = getattr(llm, "model", None) or getattr(llm, "model_name", None)
     response = llm.invoke([
         SystemMessage(content=system),
         HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}"),
@@ -622,18 +1199,27 @@ def node_generation(state: AgentState) -> dict[str, Any]:
         mlflow.log_metric("response_length_chars", len(final_response), step=gen_attempts)
         mlflow.log_metric("generation_attempts", gen_attempts)
         mlflow.log_text(final_response, f"response_attempt_{gen_attempts}.txt")
+        # Per-turn backend/model — a thread may hot-swap models across turns,
+        # unlike the run-level params logged once in run_agent() which only
+        # capture the initial container config.
+        mlflow.log_param(f"turn_{gen_attempts}_backend", resolved_backend)
+        if resolved_model:
+            mlflow.log_param(f"turn_{gen_attempts}_model", resolved_model)
     except Exception:
         pass
 
     trace = list(state.get("execution_trace", []))
     mode_note = " (+ self-critique)" if gen_mode == "self" else ""
+    model_note = f" via {resolved_backend}/{resolved_model}" if resolved_model else ""
     trace.append({"node": "generation", "status": "ok",
-                  "detail": f"generated {len(final_response)} chars{mode_note}"})
+                  "detail": f"generated {len(final_response)} chars{mode_note}{model_note}"})
     return {
         "response": final_response,
         "total_latency_ms": latency,
         "generation_attempts": gen_attempts,
         "execution_trace": trace,
+        "active_backend": resolved_backend,
+        "active_model": resolved_model,
     }
 
 
@@ -675,6 +1261,14 @@ def node_output_review(state: AgentState) -> dict[str, Any]:
     trace = list(state.get("execution_trace", []))
     mode = state.get("output_review_mode") or OUTPUT_REVIEW_MODE
 
+    # Nothing was retrieved, so generation was skipped: there is no answer to rate, and an automatic
+    # "accept, 5/5" (off/self) or a quality-gate retry (supervisor) would only pollute the preference
+    # profile. End here; the response already explains what happened.
+    if state.get("retrieval_empty"):
+        trace.append({"node": "output_review", "status": "warn",
+                      "detail": "nothing to review: no answer was generated"})
+        return {"post_generation_feedback": None, "execution_trace": trace}
+
     # --- "off" and "self" modes: passthrough ---
     if mode in ("off", "self"):
         feedback = PostGenerationFeedback(
@@ -712,7 +1306,7 @@ def node_output_review(state: AgentState) -> dict[str, Any]:
             response=state.get("response", ""),
         )
 
-        llm = _get_llm(temperature=0.0)
+        llm = _get_llm(temperature=0.0, **_llm_kwargs_from_state(state))
         try:
             eval_response = llm.invoke([HumanMessage(content=rubric_prompt)])
             raw = eval_response.content.strip()
@@ -813,7 +1407,9 @@ def node_output_review(state: AgentState) -> dict[str, Any]:
         "post_generation_feedback": feedback,
         "session_preferences": prefs,
         "approved_tool_calls": extra_tool_calls if extra_tool_calls else state.get("approved_tool_calls", []),
-        "retrieved_chunks": [] if decision == "add_context" else state.get("retrieved_chunks", []),
+        # retrieved_chunks is an append-reducer field (operator.add): returning the existing list here
+        # used to DOUBLE every chunk each time this node ran (accept, regenerate...), and returning []
+        # never cleared anything. Leaving the key out keeps the chunks exactly as they are.
         "confidence_scores": [] if decision == "add_context" else state.get("confidence_scores", []),
         "proceed_to_generation": False if decision in ("regenerate", "add_context") else True,
         "execution_trace": trace,
@@ -834,6 +1430,71 @@ def _route_after_output_review(
 # ---------------------------------------------------------------------------
 # Build the graph — topology varies by OUTPUT_REVIEW_MODE
 # ---------------------------------------------------------------------------
+
+def _tracked(node_fn):
+    """
+    Run a node with this question's MLflow run active (state["mlflow_run_id"]), so the node's own
+    mlflow.log_* calls land in that run no matter which thread / Streamlit rerun executes it.
+    A no-op when the state carries no run id.
+    """
+    @functools.wraps(node_fn)
+    def inner(state, *args, **kwargs):
+        with tracking.activate(state.get("mlflow_run_id")):
+            return node_fn(state, *args, **kwargs)
+    return inner
+
+
+def make_checkpointer():
+    """
+    In-memory LangGraph checkpointer that (de)serialises our own state classes explicitly.
+
+    Without this, LangGraph logs "Deserializing unregistered type agent_state.ToolCall ..." on every
+    resume and says it will BLOCK such types in a future release -- which would break resuming at a
+    human-review pause. The allow-list is built from agent_state itself, so a new state dataclass is
+    covered automatically. Falls back gracefully on LangGraph versions with an older serde API.
+    """
+    import dataclasses
+    import agent_state
+    from langgraph.checkpoint.memory import MemorySaver
+    allowed = [(agent_state.__name__, name) for name, obj in vars(agent_state).items()
+               if dataclasses.is_dataclass(obj) and getattr(obj, "__module__", None) == agent_state.__name__]
+    try:
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    except ImportError:
+        return MemorySaver()
+    for kwargs in ({"pickle_fallback": True, "allowed_msgpack_modules": allowed}, {"pickle_fallback": True}):
+        try:
+            return MemorySaver(serde=JsonPlusSerializer(**kwargs))
+        except TypeError:
+            continue
+    return MemorySaver()
+
+
+def runtime_info(backend: str | None = None, tier: str | None = None) -> dict[str, Any]:
+    """
+    What is ACTUALLY answering, for logging (MLflow) and display: the backend and tier after UI overrides,
+    and for llama.cpp what the server itself reports (served model, context size, GGUF, slots).
+    """
+    dep = deployment.resolve()
+    b = (backend or dep["backend"]).lower()
+    t = tier or dep["tier"]
+    info: dict[str, Any] = {"backend": b, "tier": t, "default_source": dep["source"]}
+    if b == "llamacpp":
+        props = _llamacpp_props() or {}
+        info.update(model=_llamacpp_served_model() or LLAMACPP_MODEL, n_ctx=_llamacpp_server_ctx(),
+                    gguf=props.get("model_path"), slots=props.get("total_slots"))
+    elif b == "vllm":
+        info["model"] = _resolve_model_for_tier(tier) if tier else VLLM_MODEL
+    else:
+        info["model"] = _resolve_model_for_tier(tier) if tier else OLLAMA_MODEL
+    try:
+        from embedding import EMBEDDING_MODEL, embed_options
+        info["embedding_model"] = EMBEDDING_MODEL
+        info["embedding_options"] = embed_options()
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
 
 def build_graph(checkpointer=None, output_review_mode: str | None = None,
                 hitl_enabled: bool | None = None) -> Any:
@@ -863,20 +1524,20 @@ def build_graph(checkpointer=None, output_review_mode: str | None = None,
     hitl = HITL_ENABLED if hitl_enabled is None else hitl_enabled
 
     builder = StateGraph(AgentState)
-    builder.add_node("tool_selection", node_tool_selection)
-    builder.add_node("hitl_checkpoint", node_hitl_checkpoint)
-    builder.add_node("tool_execution", node_tool_execution)
-    builder.add_node("supervisor", node_supervisor)
-    builder.add_node("context_assembly", node_context_assembly)
-    builder.add_node("generation", node_generation)
-    builder.add_node("output_review", node_output_review)
+    builder.add_node("tool_selection", _tracked(node_tool_selection))
+    builder.add_node("hitl_checkpoint", _tracked(node_hitl_checkpoint))
+    builder.add_node("tool_execution", _tracked(node_tool_execution))
+    builder.add_node("supervisor", _tracked(node_supervisor))
+    builder.add_node("context_assembly", _tracked(node_context_assembly))
+    builder.add_node("generation", _tracked(node_generation))
+    builder.add_node("output_review", _tracked(node_output_review))
 
     builder.add_edge(START, "tool_selection")
     builder.add_edge("tool_selection", "hitl_checkpoint")
     builder.add_conditional_edges(
         "hitl_checkpoint",
         _route_after_hitl,
-        {"tool_execution": "tool_execution", "__end__": END},
+        {"tool_execution": "tool_execution", "tool_selection": "tool_selection", "__end__": END},
     )
     builder.add_edge("tool_execution", "supervisor")
     builder.add_conditional_edges(
@@ -928,9 +1589,6 @@ def run_agent(query: str, repo_path: str, thread_id: str = "default",
         thread_id:  LangGraph thread ID for checkpointing
         extra_state: Optional state overrides (e.g. max_retrieval_attempts)
     """
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment("code-doc-assistant-dev")
-
     graph = build_graph()
     initial_state: AgentState = {
         "query": query,
@@ -951,33 +1609,30 @@ def run_agent(query: str, repo_path: str, thread_id: str = "default",
         "post_generation_feedback": None,
         "session_preferences": None,
         "generation_attempts": 0,
+        "active_backend": None,
+        "active_model_tier": None,
+        "active_model": None,
         "execution_trace": [],
         "mlflow_run_id": None,
         "total_latency_ms": None,
         **(extra_state or {}),
     }
 
-    with mlflow.start_run() as run:
-        mlflow.log_param("query", query)
-        mlflow.log_param("repo_path", repo_path)
-        mlflow.log_param("inference_backend", INFERENCE_BACKEND)
-        mlflow.log_param("model", (
-            VLLM_MODEL if INFERENCE_BACKEND == "vllm"
-            else LLAMACPP_MODEL if INFERENCE_BACKEND == "llamacpp"
-            else OLLAMA_MODEL
-        ))
-        mlflow.log_param("hitl_enabled", HITL_ENABLED)
-        mlflow.log_param("output_review_mode", OUTPUT_REVIEW_MODE)
-
-        initial_state["mlflow_run_id"] = run.info.run_id
-        config = {"configurable": {"thread_id": thread_id}}
+    # One run per question -- same lifecycle the Streamlit UI uses (see tracking.py).
+    runtime = runtime_info(initial_state.get("active_backend"), initial_state.get("active_model_tier"))
+    run_id = tracking.start_query_run(
+        query, runtime,
+        settings={"repo_path": repo_path, "hitl_enabled": initial_state.get("hitl_enabled", HITL_ENABLED),
+                  "output_review_mode": initial_state.get("output_review_mode", OUTPUT_REVIEW_MODE)},
+        tags={"source": "run_agent", "thread_id": thread_id},
+    )
+    initial_state["mlflow_run_id"] = run_id
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
         final_state = graph.invoke(initial_state, config=config)
-
-        # Log summary metrics
-        mlflow.log_metric("total_tool_calls", len(final_state.get("executed_tool_calls", [])))
-        mlflow.log_metric("retrieval_attempts", final_state.get("retrieval_attempts", 0))
-        mlflow.log_metric("chunks_retrieved", len(final_state.get("retrieved_chunks", [])))
-        mlflow.log_metric("supervisor_adjustments", len(final_state.get("supervisor_adjustments", [])))
-
+    except Exception as e:
+        tracking.finish_run(run_id, None, error=str(e))
+        raise
+    tracking.finish_run(run_id, final_state)
     return final_state
 

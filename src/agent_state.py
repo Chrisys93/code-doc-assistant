@@ -54,7 +54,9 @@ class SupervisorAdjustment:
 # Human-in-the-loop checkpoint result — tool plan review (pre-generation)
 # ---------------------------------------------------------------------------
 
-HumanDecision = Literal["approved", "modified", "rejected"]
+# "replan" = the reviewer rejected THIS plan but wants another one (optionally with feedback on what
+# they expected); "rejected" = stop here.
+HumanDecision = Literal["approved", "modified", "rejected", "replan"]
 
 @dataclass
 class HITLCheckpoint:
@@ -140,6 +142,8 @@ class AgentState(TypedDict):
     proposed_tool_calls: list[ToolCall]             # what the tool-selection agent wants to run
     hitl_checkpoint: Optional[HITLCheckpoint]       # human review of tool plan (pre-generation)
     approved_tool_calls: list[ToolCall]             # after human approval / modification
+    planner_feedback: Optional[str]                 # set on a re-plan: reviewer's expectations ("" = none); consumed by tool_selection
+    replan_count: int                               # how many times the reviewer sent the plan back
 
     # --- Execution (appendable — parallel tool calls safe) ---
     executed_tool_calls: Annotated[list[ToolCall], operator.add]
@@ -158,11 +162,20 @@ class AgentState(TypedDict):
     final_context: str                              # assembled, deduplicated, trimmed context
     response: str                                   # final LLM output
     source_attribution: list[str]                  # file paths that contributed to the response
+    retrieval_empty: bool                          # True when context assembly found NO chunk at all: generation is skipped and said so
 
     # --- Post-generation HITL + preference learning ---
     post_generation_feedback: Optional[PostGenerationFeedback]   # set after human reviews output
     session_preferences: Optional[SessionPreferences]            # accumulated across the session
     generation_attempts: int                                     # how many regeneration loops
+
+    # --- Runtime model selection (hot-swappable, per-turn) ---
+    # When set, overrides the INFERENCE_BACKEND/OLLAMA_MODEL/etc. env-var defaults
+    # for this turn only. Set from the Streamlit model dropdown, same pattern as
+    # hitl_enabled/output_review_mode above (live state, not env vars re-read).
+    active_backend: Optional[str]                   # "ollama" | "vllm" | "llamacpp" | None (=env default)
+    active_model_tier: Optional[str]                 # "full" | "balanced" | "lightweight" | "minimal" | None
+    active_model: Optional[str]                       # resolved model name actually used this turn
 
     # --- Execution trace — for graph visualisation highlighting in the UI ---
     # Each entry: {"node": str, "status": "ok"|"retry"|"rejected", "detail": str}

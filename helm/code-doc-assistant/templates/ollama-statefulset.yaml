@@ -60,13 +60,36 @@ spec:
             - bash
             - -c
             - |
+              # Fail loudly: a pull that silently fails leaves an empty model store and every
+              # embedding call later returns 404 (nothing is ever indexed).
+              set -u
               echo "Starting Ollama for model pull..."
               ollama serve &
-              sleep 5
-              echo "Pulling LLM model: {{ include "code-doc-assistant.ollamaModel" . }}"
-              ollama pull {{ include "code-doc-assistant.ollamaModel" . }}
-              echo "Pulling embedding model: {{ include "code-doc-assistant.embeddingModel" . }}"
-              ollama pull {{ include "code-doc-assistant.embeddingModel" . }}
+              # Wait for the server instead of a fixed sleep: startup time varies a lot.
+              up=0
+              for i in $(seq 1 90); do
+                if ollama list >/dev/null 2>&1; then up=1; break; fi
+                sleep 2
+              done
+              if [ "$up" != "1" ]; then echo "ERROR: Ollama did not become ready in 180s"; exit 1; fi
+              pull_model() {
+                m="$1"
+                for attempt in 1 2 3 4 5; do
+                  echo "Pulling $m (attempt $attempt)"
+                  if ollama pull "$m"; then return 0; fi
+                  sleep 10
+                done
+                echo "ERROR: could not pull $m"
+                return 1
+              }
+              {{- if include "code-doc-assistant.ollamaPullLlm" . }}
+              pull_model "{{ include "code-doc-assistant.ollamaModel" . }}" || exit 1
+              {{- else }}
+              echo "Skipping LLM pull (inferenceBackend={{ .Values.inferenceBackend }}); embedding model only."
+              {{- end }}
+              pull_model "{{ include "code-doc-assistant.embeddingModel" . }}" || exit 1
+              ollama list
+              ollama list | grep -q "{{ include "code-doc-assistant.embeddingModel" . }}" || { echo "ERROR: embedding model missing after pull"; exit 1; }
               echo "Model pull complete."
           volumeMounts:
             - name: ollama-data

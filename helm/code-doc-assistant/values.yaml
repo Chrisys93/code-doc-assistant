@@ -17,6 +17,9 @@ hitlEnabled: true
 confidenceThreshold: 0.45
 maxRetrievalAttempts: 3
 maxContextTokens: 8000
+# Tool-plan HITL: how many times a rejected plan may be re-planned (with or
+# without feedback) before the run ends.
+maxReplans: 3
 
 # --- Deployment Target ---
 # Controls resource profiles, storage backends, healthcheck intervals, and
@@ -39,10 +42,18 @@ deploymentTarget: "local"
 #                        Model management included. Best for full/balanced tiers.
 # "vllm"               — vLLM Deployment, GPU required, OpenAI-compatible API.
 #                        Best for high-throughput serving at scale.
-# "llamacpp"           — llama-server Deployment, CPU-native, OpenAI-compatible API.
-#                        Best for lightweight/minimal tiers on constrained machines.
+# "llamacpp"           — llama-server Deployment (CUDA image by default),
+#                        OpenAI-compatible API, runs a specific GGUF with full
+#                        control of context size and GPU offload (--n-gpu-layers).
 #                        Note: Ollama wraps llama.cpp for most models — use llamacpp
-#                        directly when running a specific GGUF with maximum control.
+#                        directly when you want that control (e.g. the heavy tier).
+# "auto"               — the app is NOT pinned: at runtime it probes the services
+#                        that are deployed (llama-server > vLLM > Ollama) and uses
+#                        what it finds. Combine with llamacpp.enabled / vllm.enabled
+#                        to deploy a backend next to Ollama.
+#
+# Pinning the backend here is what makes it the app's "container default"; the UI
+# dropdowns still let a user pick another one that is reachable.
 #
 inferenceBackend: "ollama"
 
@@ -51,6 +62,10 @@ inferenceBackend: "ollama"
 #
 #   full        → mistral-nemo:12b-instruct          best quality, GPU + 12Gi+ RAM
 #   balanced    → deepseek-coder-v2:16b-lite-instruct best code understanding at mid-range
+#   heavy       → deepseek-coder-v2:16b-lite-instruct same model as balanced, for a
+#                                                    12GB-GPU machine: bigger context /
+#                                                    explicit GPU-offload control
+#                                                    (use with inferenceBackend=llamacpp)
 #   lightweight → phi3.5                              edge/low-resource, ~4Gi RAM
 #   minimal     → qwen2.5-coder:3b-instruct           CI pipelines / very constrained dev
 #
@@ -70,6 +85,7 @@ modelTier: "full"
 #
 # Note: lightweight and minimal tiers use Ollama's built-in default quantisation
 # (already Q4); quantisation suffix is not appended for those tiers.
+# llama.cpp serves whatever GGUF file you point it at (see llamacpp.* below).
 #
 # Override at install time:
 #   helm install ... --set quantisation=q8_0
@@ -86,26 +102,83 @@ quantisation: "q4_K_M"
 #
 embeddingModel: "default"
 
-# --- llama.cpp / llama-server (only active when inferenceBackend=llamacpp) ---
+# Ollama GPU layers for EMBEDDING requests. 0 = embed on CPU (default). Embedding on
+# the GPU next to a llama-server decode makes generation collapse on a single card;
+# set to -1 only if embeddings get their own GPU.
+embedNumGpu: 0
+
+# --- llama.cpp / llama-server (active when inferenceBackend=llamacpp OR enabled=true) ---
 # llama-server exposes an OpenAI-compatible API identical to vLLM's.
-# Runs GGUF models CPU-natively (or with partial Metal/CUDA offload).
-# Recommended pairing: lightweight or minimal modelTier.
+# Anything left EMPTY below falls back to the modelTier default (see
+# _helpers.tpl: llamacppModelFile / llamacppCtx / llamacppGpuLayers):
+#
+#   tier      GGUF file (in /models)                        ctx    GPU layers
+#   heavy     deepseek-coder-v2-lite-instruct-q4_k_m.gguf   4096   24   (deliberately conservative on 12GB)
+#   full      mistral-nemo-instruct-2407-q4_k_m.gguf        8192   999  (999 = every layer)
+#   minimal   qwen2.5-coder-3b-instruct-q4_k_m.gguf         2048   999
+#   balanced / lightweight → no default GGUF: set llamacpp.modelFile
 llamacpp:
+  # Deploy llama-server even though inferenceBackend is something else (side-by-side
+  # comparison, or inferenceBackend=auto).
+  enabled: false
   image:
-    repository: ghcr.io/ggerganov/llama.cpp
-    tag: server
+    # The old ggerganov/llama.cpp GHCR path no longer exists; it is ggml-org now.
+    # server-cuda is required for GPU offload; use tag "server" (and gpu.enabled=false)
+    # for a CPU-only cluster.
+    repository: ghcr.io/ggml-org/llama.cpp
+    tag: server-cuda
     pullPolicy: IfNotPresent
   service:
-    port: 8081
-  # Path to the GGUF model file inside the container (mounted from llamacpp_models volume)
-  modelPath: "/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
-  servedModelName: "qwen2.5-coder-3b-instruct-q4_k_m"
-  contextSize: 2048
-  threads: 4          # CPU threads for inference; set to physical core count
-  gpuLayers: 0        # layers to offload to GPU (0 = CPU-only)
+    port: 8081          # Service port; llama-server itself listens on 8080 in the pod
+  modelFile: ""         # GGUF file name inside /models. Empty = tier default.
+  servedModelName: ""   # name the server reports (-a). Empty = file name without .gguf
+  contextSize: ""       # --ctx-size.        Empty = tier default
+  gpuLayers: ""         # --n-gpu-layers.    Empty = tier default (0 is a valid value: CPU only)
+  threads: 4            # CPU threads; set to the physical core count
+  # Startup budget = startupFailureThreshold x 10 s before the pod is killed for not being
+  # healthy. Loading the 10GB heavy-tier model took ~15 min on minikube/WSL2, so the default
+  # is 30 min (180). Raise it if your volume is slower; model load speed is storage-bound.
+  startupFailureThreshold: 180
+  extraArgs: []         # appended verbatim, e.g. ["--flash-attn", "on", "--n-cpu-moe", "8"]
+  gpu:
+    enabled: true       # give the pod the GPU at all (false = CPU only)
+    # How the pod gets the GPU:
+    #   resource - request nvidia.com/gpu: 1; needs the NVIDIA device plugin to advertise it
+    #              (normal Linux clusters)
+    #   runtime  - no resource request; NVIDIA_VISIBLE_DEVICES=all makes the node's NVIDIA
+    #              container runtime inject the GPU. Use where the device plugin cannot see
+    #              the GPU (WSL2 / minikube: its NVML init fails with "Not Supported"). The
+    #              node's Docker must have nvidia as default runtime, or set runtimeClassName.
+    #              Nothing limits the pod to one GPU in this mode, so keep one GPU consumer.
+    mode: "resource"
+    runtimeClassName: ""  # e.g. "nvidia", if the cluster has such a RuntimeClass
+    # WSL2 (minikube / kind nodes running in Docker Desktop's WSL2 engine): a container nested
+    # in the node gets /dev/dxg and the driver libraries but NOT libdxcore.so, so NVML fails
+    # ("Failed to initialize NVML"). wsl2=true implies mode=runtime AND mounts the node's
+    # libdxcore.so into the pod. Verified by hand with `docker run --gpus all -v
+    # <libdxcorePath>:<libdxcorePath>:ro ... nvidia-smi -L` inside the minikube node.
+    wsl2: false
+    libdxcorePath: "/usr/lib/x86_64-linux-gnu/libdxcore.so"  # path inside the NODE
+  resources: {}         # extra requests/limits, e.g. {limits: {memory: 16Gi}}
+  nodeSelector: {}      # e.g. {nvidia.com/gpu.present: "true"}
+  tolerations: []       # e.g. for tainted GPU nodes
+  # Where the GGUF files live (mounted at /models). First match wins:
+  models:
+    hostPath: ""        # e.g. /home/me/code-doc-dev/models  (local clusters)
+    existingClaim: ""   # name of a PVC that already holds the GGUFs
+    persistence:        # otherwise: a PVC created by this chart (if enabled), else emptyDir
+      enabled: true
+      size: 20Gi
+      storageClass: ""
+  # Fetch the GGUF at pod start if it is missing. url empty = the verified bartowski
+  # Q4_K_M URL for the heavy / full tier (see _helpers.tpl); other tiers need a url.
+  download:
+    enabled: false
+    url: ""
 
-# --- vLLM (only active when inferenceBackend=vllm) ---
+# --- vLLM (active when inferenceBackend=vllm OR enabled=true) ---
 vllm:
+  enabled: false        # deploy vLLM even though inferenceBackend is something else
   image:
     repository: vllm/vllm-openai
     tag: latest
@@ -118,7 +191,11 @@ vllm:
   gpuMemoryUtilization: "0.90"
 
 # --- Ollama ---
+# Always deployed: it serves the embedding model for every backend. The chat model
+# is only pulled when Ollama is (or may be) the answering backend, i.e.
+# inferenceBackend is "ollama" or "auto" — or when pullLlm is forced to true.
 ollama:
+  pullLlm: ""           # "" = follow inferenceBackend, "true" / "false" = force
   image:
     repository: ollama/ollama
     tag: latest
@@ -140,9 +217,11 @@ app:
   service:
     type: ClusterIP
     port: 8501
+    nodePort: ""    # only used when type=NodePort (30000-32767)
   env:
     OLLAMA_HOST: ""         # auto-set by _helpers.tpl
-    VLLM_HOST: ""           # auto-set by _helpers.tpl when inferenceBackend=vllm
+    VLLM_HOST: ""           # auto-set by _helpers.tpl
+    LLAMACPP_HOST: ""       # auto-set by _helpers.tpl
     OLLAMA_MODEL: ""        # auto-set by _helpers.tpl from modelTier + quantisation
     MLFLOW_TRACKING_URI: "" # auto-set by _helpers.tpl to in-cluster MLflow
     LOG_LEVEL: "info"
@@ -174,6 +253,7 @@ vectordb:
     searchEf: 50
 
 # --- MLflow tracking server ---
+# The agent logs ONE run per question (params, metrics, result.json) to this server.
 mlflow:
   enabled: true
   image:
@@ -181,13 +261,32 @@ mlflow:
     tag: latest
     pullPolicy: IfNotPresent
   service:
+    type: ClusterIP
     port: 5000
+    nodePort: ""    # only used when type=NodePort (30000-32767)
   persistence:
     enabled: true
     size: 5Gi
     storageClass: ""
+  # Empty = chart default (none on deploymentTarget=local, 512Mi/2Gi on cluster).
+  # A 512Mi limit makes the current MLflow image OOMKilled, so do not go below ~1Gi.
+  resources: {}
   backendStoreUri: "sqlite:////mlflow/mlflow.db"
   defaultArtifactRoot: "/mlflow/artifacts"
+  # Recent MLflow servers answer 403 "Invalid Host header" to any Host not in
+  # --allowed-hosts, which silently disables tracking. The chart always allows the
+  # in-cluster Service names (short, .<ns>, .<ns>.svc, .<ns>.svc.cluster.local, each
+  # with and without the port) and localhost (kubectl port-forward). Add anything
+  # else you reach it by (ingress host, node IP:port, ...):
+  allowedHosts: []
+  # Browser-reachable MLflow URL, used only for the links in the UI's Session tab.
+  # The default matches `kubectl port-forward svc/<release>-code-doc-assistant-mlflow 5000:5000`.
+  uiUrl: "http://localhost:5000"
+  experiment: "code-doc-assistant-dev"
+
+# Optional label stored as tag `eval.group` on every MLflow run, to group the runs of
+# one evaluation batch (e.g. "deepseek-llamacpp-vs-ollama"). Empty = no tag.
+evalGroup: ""
 
 # --- Ingress (optional) ---
 ingress:

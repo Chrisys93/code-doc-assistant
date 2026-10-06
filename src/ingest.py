@@ -84,12 +84,23 @@ SKIP_DIRS = {
 }
 
 
-def clone_repo(repo_url: str, target_dir: Optional[str] = None) -> str:
-    """Clone a git repository and return the local path."""
+def clone_repo(repo_url: str, target_dir: Optional[str] = None, branch: Optional[str] = None) -> str:
+    """
+    Clone a git repository and return the local path.
+
+    branch: optional branch/tag/ref to clone (e.g. "dev"). Without it,
+    GitPython/git clones the repo's default branch (usually "master" or
+    "main") — NOT whatever branch you happen to be viewing on github.com.
+    A GitHub web URL like ".../tree/dev" is NOT a valid git clone target;
+    use the plain repo URL and pass branch="dev" explicitly instead.
+    """
     if target_dir is None:
         target_dir = tempfile.mkdtemp(prefix="code-doc-")
-    logger.info(f"Cloning {repo_url} to {target_dir}")
-    GitRepo.clone_from(repo_url, target_dir, depth=1)
+    logger.info(f"Cloning {repo_url} (branch={branch or 'default'}) to {target_dir}")
+    if branch:
+        GitRepo.clone_from(repo_url, target_dir, depth=1, branch=branch)
+    else:
+        GitRepo.clone_from(repo_url, target_dir, depth=1)
     logger.info("Clone complete")
     return target_dir
 
@@ -208,7 +219,37 @@ def load_and_chunk_files(files: list[dict]) -> list:
         logger.info(f"  text/config: {len(text_docs)} files → {len(nodes)} chunks")
 
     logger.info(f"Total chunks: {len(all_nodes)}")
-    return all_nodes
+    return dedupe_nodes(all_nodes)
+
+
+def dedupe_nodes(nodes: list) -> list:
+    """
+    Drop chunks whose text is identical (ignoring whitespace differences) to an earlier one.
+
+    Identical text embeds to an identical vector, so a repeat adds no retrieval value -- it only
+    takes up a top-k slot at query time and costs embedding time at ingest. Large generated or
+    boilerplate-heavy files produce many such repeats (one Icarus file alone yielded 730 chunks,
+    and a third of that collection was exact repeats). The first occurrence is kept.
+    """
+    seen: set[int] = set()
+    kept: list = []
+    dropped_by_file: dict[str, int] = {}
+    for node in nodes:
+        text = node.get_content() if hasattr(node, "get_content") else getattr(node, "text", "")
+        key = hash(" ".join(text.split()))
+        if key in seen:
+            f = (getattr(node, "metadata", None) or {}).get("file_path", "?")
+            dropped_by_file[f] = dropped_by_file.get(f, 0) + 1
+            continue
+        seen.add(key)
+        kept.append(node)
+    if dropped_by_file:
+        top = sorted(dropped_by_file.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        logger.info(
+            f"De-duplicated chunks: dropped {len(nodes) - len(kept)} exact repeats "
+            f"(most in: {', '.join(f'{f} x{n}' for f, n in top)})"
+        )
+    return kept
 
 
 def build_index(
@@ -216,11 +257,8 @@ def build_index(
     vector_store_impl: ChromaVectorStoreImpl,
 ) -> VectorStoreIndex:
     """Embed chunks and store in the vector database."""
-    from llama_index.embeddings.ollama import OllamaEmbedding
-    embed_model = OllamaEmbedding(
-        model_name=EMBEDDING_MODEL,
-        base_url=OLLAMA_HOST,
-    )
+    from embedding import get_embed_model  # shared with query-time retrieval; CPU by default
+    embed_model = get_embed_model()
     vector_store = vector_store_impl.get_vector_store()
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
@@ -237,11 +275,8 @@ def build_index(
 
 def load_existing_index(vector_store_impl: ChromaVectorStoreImpl) -> VectorStoreIndex:
     """Load an existing index from the vector store (no re-ingestion)."""
-    from llama_index.embeddings.ollama import OllamaEmbedding
-    embed_model = OllamaEmbedding(
-        model_name=EMBEDDING_MODEL,
-        base_url=OLLAMA_HOST,
-    )
+    from embedding import get_embed_model
+    embed_model = get_embed_model()
     vector_store = vector_store_impl.get_vector_store()
     index = VectorStoreIndex.from_vector_store(
         vector_store=vector_store,

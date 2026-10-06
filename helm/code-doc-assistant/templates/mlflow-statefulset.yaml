@@ -30,9 +30,12 @@ spec:
             - mlflow
             - server
             - --host=0.0.0.0
-            - --port={{ .Values.mlflow.service.port | quote }}
+            - --port={{ .Values.mlflow.service.port }}
             - --backend-store-uri={{ .Values.mlflow.backendStoreUri }}
             - --default-artifact-root={{ .Values.mlflow.defaultArtifactRoot }}
+            # Without this, MLflow rejects the app's Host header (403 "Invalid Host
+            # header") and tracking silently records nothing.
+            - --allowed-hosts={{ include "code-doc-assistant.mlflowAllowedHosts" . }}
           volumeMounts:
             - name: mlflow-data
               mountPath: /mlflow
@@ -40,21 +43,26 @@ spec:
             httpGet:
               path: /health
               port: http
+              httpHeaders:
+                - name: Host
+                  value: "localhost:{{ .Values.mlflow.service.port }}"
             initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
               port: http
+              httpHeaders:
+                - name: Host
+                  value: "localhost:{{ .Values.mlflow.service.port }}"
             initialDelaySeconds: 15
             periodSeconds: 30
           resources:
-            requests:
-              memory: "256Mi"
-              cpu: "100m"
-            limits:
-              memory: "512Mi"
-              cpu: "500m"
+            {{- if .Values.mlflow.resources }}
+            {{- toYaml .Values.mlflow.resources | nindent 12 }}
+            {{- else }}
+            {{- include "code-doc-assistant.mlflowResources" . | nindent 12 }}
+            {{- end }}
   {{- if .Values.mlflow.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:

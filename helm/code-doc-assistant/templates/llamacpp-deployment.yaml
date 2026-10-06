@@ -1,0 +1,171 @@
+{{- if include "code-doc-assistant.llamacppEnabled" . -}}
+{{- $file := include "code-doc-assistant.llamacppModelFile" . -}}
+{{- /* wsl2 implies runtime mode: the device plugin cannot see a WSL2 GPU */ -}}
+{{- $runtime := or (eq (.Values.llamacpp.gpu.mode | default "resource") "runtime") .Values.llamacpp.gpu.wsl2 -}}
+{{- $claim := "" -}}
+{{- if .Values.llamacpp.models.existingClaim -}}
+{{- $claim = .Values.llamacpp.models.existingClaim -}}
+{{- else if .Values.llamacpp.models.persistence.enabled -}}
+{{- $claim = printf "%s-llamacpp-models" (include "code-doc-assistant.fullname" .) -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "code-doc-assistant.fullname" . }}-llamacpp
+  labels:
+    {{- include "code-doc-assistant.labels" . | nindent 4 }}
+    app.kubernetes.io/component: llamacpp
+spec:
+  replicas: 1
+  # One GPU, one server: never run the old and new pod side by side during a rollout.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
+      app.kubernetes.io/component: llamacpp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
+        app.kubernetes.io/component: llamacpp
+    spec:
+      {{- with .Values.llamacpp.gpu.runtimeClassName }}
+      runtimeClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.llamacpp.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.llamacpp.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.llamacpp.download.enabled }}
+      {{- $url := include "code-doc-assistant.llamacppDownloadUrl" . }}
+      {{- if not $url }}
+      {{- fail "llamacpp.download.enabled needs llamacpp.download.url when llamacpp.modelFile is set or the tier has no default URL" }}
+      {{- end }}
+      initContainers:
+        - name: fetch-model
+          image: curlimages/curl:8.10.1
+          securityContext:
+            runAsUser: 0
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              f="/models/{{ $file }}"
+              if [ -s "$f" ]; then echo "model already present: $f"; exit 0; fi
+              echo "downloading {{ $url }}"
+              curl -fL --retry 3 -o "$f.part" "{{ $url }}"
+              mv "$f.part" "$f"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      {{- end }}
+      containers:
+        - name: llamacpp
+          image: "{{ .Values.llamacpp.image.repository }}:{{ .Values.llamacpp.image.tag }}"
+          imagePullPolicy: {{ .Values.llamacpp.image.pullPolicy }}
+          # The ggml-org server images keep the binary at /app/llama-server.
+          command: ["/app/llama-server"]
+          args:
+            - "--model"
+            - "/models/{{ $file }}"
+            - "-a"
+            - {{ include "code-doc-assistant.llamacppServedName" . | quote }}
+            - "--ctx-size"
+            - {{ include "code-doc-assistant.llamacppCtx" . | quote }}
+            - "--threads"
+            - {{ .Values.llamacpp.threads | quote }}
+            - "--n-gpu-layers"
+            - {{ include "code-doc-assistant.llamacppGpuLayers" . | quote }}
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8080"
+            {{- range .Values.llamacpp.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- if and .Values.llamacpp.gpu.enabled $runtime }}
+          # gpu.mode=runtime: no nvidia.com/gpu request. The node's NVIDIA container runtime
+          # hands the GPU to the container because of these variables (needs nvidia as the
+          # node's default runtime, or gpu.runtimeClassName). Used where the device plugin
+          # cannot see the GPU, e.g. WSL2.
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+          {{- end }}
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              {{- if not .Values.llamacpp.download.enabled }}
+              readOnly: true
+              {{- end }}
+            {{- if and .Values.llamacpp.gpu.enabled .Values.llamacpp.gpu.wsl2 }}
+            # WSL2: the NVIDIA runtime nested inside the node does not inject libdxcore.so,
+            # so NVML fails with "Not Supported". Mount the node's copy in.
+            - name: wsl-libdxcore
+              mountPath: {{ .Values.llamacpp.gpu.libdxcorePath | quote }}
+              readOnly: true
+            {{- end }}
+          # Loading a 10GB GGUF can take a long time (about 15 minutes was measured on
+          # minikube/WSL2). The pod is killed if /health is not up within
+          # periodSeconds x failureThreshold, so the budget is a value, not a constant.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: {{ .Values.llamacpp.startupFailureThreshold | default 180 }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            {{- with .Values.llamacpp.resources.requests }}
+            requests:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+            {{- $gpuRes := and .Values.llamacpp.gpu.enabled (not $runtime) }}
+            {{- if or .Values.llamacpp.resources.limits $gpuRes }}
+            limits:
+              {{- with .Values.llamacpp.resources.limits }}
+              {{- toYaml . | nindent 14 }}
+              {{- end }}
+              {{- if $gpuRes }}
+              nvidia.com/gpu: 1
+              {{- end }}
+            {{- end }}
+      volumes:
+        - name: models
+          {{- if .Values.llamacpp.models.hostPath }}
+          hostPath:
+            path: {{ .Values.llamacpp.models.hostPath | quote }}
+            type: DirectoryOrCreate
+          {{- else if $claim }}
+          persistentVolumeClaim:
+            claimName: {{ $claim }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if and .Values.llamacpp.gpu.enabled .Values.llamacpp.gpu.wsl2 }}
+        - name: wsl-libdxcore
+          hostPath:
+            path: {{ .Values.llamacpp.gpu.libdxcorePath | quote }}
+            type: File
+        {{- end }}
+{{- end }}

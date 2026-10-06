@@ -1,0 +1,20 @@
+{{- if and (include "code-doc-assistant.llamacppEnabled" .) (not .Values.llamacpp.models.hostPath) (not .Values.llamacpp.models.existingClaim) .Values.llamacpp.models.persistence.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "code-doc-assistant.fullname" . }}-llamacpp-models
+  labels:
+    {{- include "code-doc-assistant.labels" . | nindent 4 }}
+    app.kubernetes.io/component: llamacpp
+  annotations:
+    # Keep the downloaded GGUFs when the release is uninstalled / upgraded.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- if .Values.llamacpp.models.persistence.storageClass }}
+  storageClassName: {{ .Values.llamacpp.models.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.llamacpp.models.persistence.size }}
+{{- end }}

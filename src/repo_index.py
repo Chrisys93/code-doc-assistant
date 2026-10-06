@@ -14,31 +14,88 @@ repo the user entered is indexed (idempotent: already-indexed repos are skipped)
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import re
+import urllib.request
 
 logger = logging.getLogger(__name__)
 
 _MAX_SLUG = 40  # keep total collection name within Chroma's 63-char limit
 
 
+def _parse_ref(repo_ref: str) -> tuple[str, str | None]:
+    """
+    Split a repo reference into (url_or_path, branch). Branch syntax is
+    `<url>#<branch>` (e.g. "https://github.com/x/y.git#dev") — a '#' fragment,
+    not '@', because git@host:owner/repo.git SSH URLs already use '@' as part
+    of the URL itself and splitting on it would break them.
+
+    A bare GitHub web URL like ".../tree/dev" is explicitly NOT treated as a
+    valid clone target — that's a browsing URL, not a git remote. If someone
+    pastes one, ensure_indexed() will fail clone_repo() and report status=error
+    with a message pointing at the #branch syntax instead.
+    """
+    ref = (repo_ref or "").strip()
+    if "#" in ref:
+        url, branch = ref.rsplit("#", 1)
+        branch = branch.strip() or None
+        return url.strip(), branch
+    return ref, None
+
+
 def collection_for_repo(repo_ref: str) -> str:
     """
-    Stable ChromaDB collection name for a repo URL or local path.
+    Stable ChromaDB collection name for a repo URL/path (+ optional #branch).
 
     Same ref -> same collection every time; different repos never collide
-    (a short hash of the full ref disambiguates same-named repos from
-    different owners/hosts). Result matches Chroma's naming rules:
-    3-63 chars, starts/ends alphanumeric, only [a-z0-9_].
+    (a short hash of the full ref, including branch, disambiguates same-named
+    repos from different owners/hosts AND different branches of the same repo
+    — "x.git" and "x.git#dev" hash to different collections). Result matches
+    Chroma's naming rules: 3-63 chars, starts/ends alphanumeric, only [a-z0-9_].
     """
     ref = (repo_ref or "").strip().rstrip("/")
-    name = ref.split("/")[-1]
+    url, branch = _parse_ref(ref)
+    name = url.split("/")[-1]
     if name.endswith(".git"):
         name = name[:-4]
+    if branch:
+        name = f"{name}_{branch}"
     slug = re.sub(r"[^a-zA-Z0-9_]+", "_", name).strip("_").lower() or "repo"
     slug = slug[:_MAX_SLUG]
     digest = hashlib.sha1(ref.encode("utf-8")).hexdigest()[:8]
     return f"repo_{slug}_{digest}"
+
+
+def embedding_ready(timeout: float = 4.0) -> tuple[bool, str]:
+    """Is the embedding model actually available in Ollama? (ok, reason).
+
+    Checked BEFORE a repo is ingested: without the model every embedding call 404s, the collection
+    is created but stays empty, and the failure used to show up only as a model answering
+    "no specific information" from an empty context.
+    """
+    model = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{host}/api/tags", timeout=timeout) as r:
+            names = [m.get("name", "") for m in json.load(r).get("models", [])]
+    except Exception as e:  # unreachable, DNS, 5xx ...
+        return False, f"Ollama is not reachable at {host} ({e})"
+    base = model.split(":")[0]
+    if any(n.split(":")[0] == base for n in names):
+        return True, "ok"
+    have = ", ".join(names) or "no models at all"
+    return False, f"embedding model '{model}' is not available in Ollama at {host} (it has: {have})"
+
+
+def _hint(error: str) -> str:
+    model = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
+    if "not available in Ollama" in error or "try pulling" in error or "Ollama is not reachable" in error:
+        return (f"Pull the embedding model into Ollama: `ollama pull {model}` inside the Ollama container "
+                f"(Kubernetes: `kubectl -n <namespace> exec <ollama-pod> -- ollama pull {model}`; "
+                f"Compose: `docker compose exec ollama ollama pull {model}`), then ask again.")
+    return "See the app log for the full traceback."
 
 
 def _chroma_client(chroma_host: str):
@@ -60,13 +117,22 @@ def repo_indexed(repo_ref: str, chroma_host: str, min_docs: int = 1) -> tuple[bo
 
 
 def _resolve_to_path(repo_ref: str) -> str:
-    """Clone a URL to a writable temp dir; return local paths unchanged."""
+    """Clone a URL (optionally #branch) to a writable temp dir; local paths unchanged."""
+    url, branch = _parse_ref(repo_ref)
+    is_url = url.startswith(("http://", "https://", "git@")) or url.endswith(".git")
+    if not is_url:
+        return url
+    if "/tree/" in url or "/blob/" in url:
+        raise ValueError(
+            f"{url!r} looks like a GitHub web (browsing) URL, not a git remote. "
+            f"Use the plain repo URL with #branch instead, e.g. "
+            f"'https://github.com/owner/repo.git#dev'."
+        )
     try:
         from src.ingest import clone_repo
     except ImportError:
         from ingest import clone_repo
-    is_url = repo_ref.startswith(("http://", "https://", "git@")) or repo_ref.endswith(".git")
-    return clone_repo(repo_ref) if is_url else repo_ref
+    return clone_repo(url, branch=branch)
 
 
 def ensure_indexed(repos: list[str], chroma_host: str,
@@ -98,16 +164,29 @@ def ensure_indexed(repos: list[str], chroma_host: str,
             results[ref] = {"collection": coll, "docs": n, "status": "already_indexed"}
             continue
 
+        ok, why = embedding_ready()
+        if not ok:
+            logger.error("ensure_indexed: not ingesting %s: %s", ref, why)
+            results[ref] = {"collection": coll, "docs": n, "status": "error", "error": why, "hint": _hint(why)}
+            continue
+
         try:
             path = _resolve_to_path(ref)
             store = ChromaVectorStoreImpl(host=chroma_host, collection_name=coll)
             # reset only when forcing a re-index; a fresh collection is already empty.
             ingest_codebase(path, store, reset=force)
-            results[ref] = {"collection": coll, "docs": store.document_count,
-                            "status": "reindexed" if force else "ingested"}
+            docs = store.document_count
+            if docs == 0:
+                msg = "ingestion finished but the collection is empty (0 chunks stored)"
+                logger.error("ensure_indexed: %s: %s", ref, msg)
+                results[ref] = {"collection": coll, "docs": 0, "status": "error", "error": msg,
+                                "hint": "Check the app log around the ingestion step for embedding errors."}
+            else:
+                results[ref] = {"collection": coll, "docs": docs,
+                                "status": "reindexed" if force else "ingested"}
         except Exception as e:
             logger.exception("ensure_indexed failed for %s", ref)
-            results[ref] = {"collection": coll, "docs": n, "status": "error", "error": str(e)}
+            results[ref] = {"collection": coll, "docs": n, "status": "error", "error": str(e), "hint": _hint(str(e))}
 
     return results
 

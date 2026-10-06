@@ -35,3 +35,16 @@ mlflow.db
 
 # vLLM model cache (local testing)
 vllm_cache/
+*:Zone.Identifier
+
+# local artefacts
+*.bak
+minikube-linux-amd64
+models/
+
+# local artefacts
+*.bak
+minikube-linux-amd64
+models/
+patch_tools.py
+test_pipeline.py

@@ -231,6 +231,10 @@ def tool_vector_search(query: str, chroma_host: str = "", collection_name: str =
     score with fair per-repo representation. This enables multi-repo queries:
     each repo lives in its own collection; a query can span one, a group, or all.
 
+    Identical chunks (same text, ignoring whitespace) are collapsed to one BEFORE the
+    top_k cut, so repeated boilerplate cannot occupy several of the result slots. This
+    also protects collections that were ingested before ingestion de-duplicated.
+
     Args:
         query:            Natural language or code query
         chroma_host:      ChromaDB HTTP host (defaults to $CHROMA_HOST)
@@ -269,13 +273,11 @@ def tool_vector_search(query: str, chroma_host: str = "", collection_name: str =
         # Embed the query ONCE with the SAME model used at ingestion (nomic-embed-text,
         # 768-dim, via Ollama). Passing query_embeddings prevents Chroma from falling back
         # to its default all-MiniLM embedder (384-dim), which mismatches the stored vectors
-        # and makes every query fail silently into 0 results.
-        from llama_index.embeddings.ollama import OllamaEmbedding
-        embed_model = OllamaEmbedding(
-            model_name=os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"),
-            base_url=os.environ.get("OLLAMA_HOST", "http://ollama:11434"),
-        )
-        query_vec = embed_model.get_query_embedding(query)
+        # and makes every query fail silently into 0 results. The client comes from
+        # embedding.py, shared with ingestion; it runs the model on CPU by default so it
+        # never competes with the answering LLM for GPU memory (see embedding.py).
+        from embedding import get_embed_model
+        query_vec = get_embed_model().get_query_embedding(query)
         where = {"file_path": {"$eq": filter_file}} if filter_file else None
 
         chunks = []
@@ -286,28 +288,37 @@ def tool_vector_search(query: str, chroma_host: str = "", collection_name: str =
             except Exception:
                 continue  # collection missing (repo not indexed) — skip, search the rest
             searched.append(cname)
+            # Over-fetch (2x) so that removing duplicates still leaves top_k distinct chunks,
+            # but never ask for more than the collection holds (Chroma warns when asked to).
+            fetch_k = max(1, min(top_k * 2, collection.count()))
             results = collection.query(
                 query_embeddings=[query_vec],
-                n_results=top_k,
+                n_results=fetch_k,
                 where=where,
                 include=["documents", "metadatas", "distances"],
             )
             if not results.get("documents") or not results["documents"][0]:
                 continue
+            seen_text: set[int] = set()
             for doc, meta, dist in zip(results["documents"][0],
                                        results["metadatas"][0],
                                        results["distances"][0]):
                 score = 1 - dist
-                if score >= score_threshold:
-                    chunks.append({
-                        "content": doc,
-                        "source_file": meta.get("file_path") or meta.get("source_file", "unknown"),
-                        "start_line": meta.get("start_line"),
-                        "end_line": meta.get("end_line"),
-                        "chunk_type": meta.get("chunk_type", "text"),
-                        "repo": cname,
-                        "confidence": round(score, 4),
-                    })
+                if score < score_threshold:
+                    continue
+                key = hash(" ".join(doc.split()))
+                if key in seen_text:
+                    continue  # identical chunk already kept (results arrive best-first)
+                seen_text.add(key)
+                chunks.append({
+                    "content": doc,
+                    "source_file": meta.get("file_path") or meta.get("source_file", "unknown"),
+                    "start_line": meta.get("start_line"),
+                    "end_line": meta.get("end_line"),
+                    "chunk_type": meta.get("chunk_type", "text"),
+                    "repo": cname,
+                    "confidence": round(score, 4),
+                })
 
         # Fair merge across collections: interleave by within-collection rank so a larger
         # repo can't crowd out a smaller one. (Single collection → plain score order.)

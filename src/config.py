@@ -37,22 +37,32 @@ INFERENCE_BACKEND = os.getenv("INFERENCE_BACKEND", "ollama").lower()
 # ---------------------------------------------------------------------------
 MODEL_TIER = os.getenv("MODEL_TIER", "full")
 
-# Base model per tier — matches _helpers.tpl baseModel resolution
+# Base model per tier — matches _helpers.tpl baseModel resolution.
+# "heavy" is explicit and opt-in: deepseek-coder-v2:16b-lite-instruct's MoE
+# VRAM footprint is dominated by total params (16B), not active params
+# (~2.4B/token) — needs ~13GB regardless of "lite" compute cost, doesn't
+# fit a 12GB card alongside context (see ARCHITECTURE.md Phase 19). It
+# briefly occupied "balanced" by mistake; now has its own labelled slot.
 _MODEL_TIER_BASE = {
+    "heavy":       "deepseek-coder-v2:16b-lite-instruct",
     "full":        "mistral-nemo:12b-instruct",
-    "balanced":    "deepseek-coder-v2:16b-lite-instruct",
+    "balanced":    "qwen2.5-coder:7b",
     "lightweight": "phi3.5",
     "minimal":     "qwen2.5-coder:3b-instruct",
 }
 
-# Quantisation suffix — appended for full/balanced; suppressed for lightweight/minimal
-# (those tiers use Ollama's built-in default quantisation, already Q4)
+# Quantisation suffix — appended for heavy/full; suppressed for balanced/lightweight/minimal.
+# heavy's deepseek-coder-v2:16b-lite-instruct-q4_K_M was empirically confirmed
+# to exist and pull successfully. balanced uses qwen2.5-coder:7b as a
+# known-working bare tag instead (matches master's proven config) — no
+# verified qwen2.5-coder:7b-<quant> tag exists to compose against, and
+# guessing one risks a "model not found" 404 at pull time.
 QUANTISATION = os.getenv("QUANTISATION", "q4_K_M")
 
 def _resolve_ollama_model() -> str:
     """Compose the final Ollama model tag from MODEL_TIER + QUANTISATION."""
     base = _MODEL_TIER_BASE.get(MODEL_TIER, "mistral-nemo:12b-instruct")
-    if MODEL_TIER in ("lightweight", "minimal"):
+    if MODEL_TIER in ("lightweight", "minimal", "balanced"):
         return base
     if QUANTISATION == "fp16":
         return base
@@ -123,7 +133,7 @@ CHROMA_HNSW_SEARCH_EF = int(
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info").upper()
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
-TOP_K = int(os.getenv("TOP_K", "5"))
+TOP_K = int(os.getenv("TOP_K", "10"))
 
 # Chunking strategy:
 # "ast"  → AST-aware via tree-sitter (higher quality, more CPU/memory)

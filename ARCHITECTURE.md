@@ -66,7 +66,7 @@ A single `modelTier` value cascades through the entire system:
 
 ```mermaid
 flowchart LR
-    MT["modelTier=balanced"] --> M["deepseek-coder-v2:16b-lite-instruct"]
+    MT["modelTier=heavy"] --> M["deepseek-coder-v2:16b-lite-instruct"]
     Q["quantisation=q4_K_M"] --> TAG["final tag:\ndeepseek-coder-v2:16b-lite-instruct-q4_K_M"]
     M --> TAG
     TAG --> RES["resource limits\nCPU/GPU allocation"]
@@ -89,12 +89,13 @@ flowchart LR
 
 **Tiered defaults** (matches `config.py`'s `_MODEL_TIER_BASE`):
 
+0. **Heavy** (explicit, opt-in) — DeepSeek-Coder V2 Lite (16B, MoE). MoEs are particularly effective for multi-language tasks, treating programming language diversity analogously to natural language multilingualism ([Wang et al., 2025](https://arxiv.org/abs/2508.19268)). It has its own slot because its VRAM footprint is dominated by total, not active, parameters (see Phase 19).
 1. **Full** — Mistral Nemo (12B). Best balance of explanation quality and code understanding.
-2. **Balanced** — DeepSeek-Coder V2 Lite (16B, MoE). Updated from the originally-evaluated Qwen2.5-Coder 7B — recent research on MoE architectures confirms they're particularly effective for multi-language tasks, treating programming language diversity analogously to natural language multilingualism ([Wang et al., 2025](https://arxiv.org/abs/2508.19268)).
+2. **Balanced** — Qwen2.5-Coder 7B (dense). DeepSeek V2 Lite briefly held this slot and was moved to `heavy` (Phase 19).
 3. **Lightweight** — Phi-3.5 Mini (3.8B). Edge, CPU-only, or resource-constrained deployments. Fine-tuning candidate.
 4. **Minimal** — Qwen2.5-Coder 3B. Tightest memory footprint; CI pipelines and very constrained machines.
 
-*Note: Qwen2.5-Coder 7B (evaluated above) was the original `balanced`-tier candidate before the DeepSeek V2 Lite swap; it does not appear in the current tier mapping. The 3B Qwen2.5-Coder variant serves `minimal` instead.*
+*Note: Qwen2.5-Coder 7B was the original `balanced` candidate, was replaced by DeepSeek V2 Lite for a while, and is `balanced` again (Phase 19). The 3B Qwen2.5-Coder variant serves `minimal`.*
 
 **Hardware reality check**: frontier models reach trillions of parameters — three orders of magnitude above these. But without a multi-GPU system, models above ~16B aren't practical to serve. These tiers reflect models genuinely usable on realistic hardware.
 
@@ -601,7 +602,7 @@ The jump from "collect feedback" to "train on feedback" is smaller than it appea
 The dev branch introduces three independently composable configuration values that together define the full deployment profile:
 
 ```yaml
-modelTier:       "full" | "balanced" | "lightweight" | "minimal"
+modelTier:       "heavy" | "full" | "balanced" | "lightweight" | "minimal"
 quantisation:    "q4_K_M" | "q8_0" | "fp16"
 deploymentTarget: "local" | "cluster"
 ```
@@ -613,7 +614,8 @@ These are orthogonal by design: `modelTier` is the capability selector, `quantis
 | Tier | Model | Notes |
 |---|---|---|
 | `full` | mistral-nemo:12b-instruct | Best quality, GPU + 12Gi+ RAM |
-| `balanced` | deepseek-coder-v2:16b-lite-instruct | Best code understanding at mid-range |
+| `heavy` | deepseek-coder-v2:16b-lite-instruct | Explicit/opt-in, ~13GB VRAM for a full GPU fit (partial offload on 12GB), MoE, strong polyglot reasoning; see Phase 19 |
+| `balanced` | qwen2.5-coder:7b | Best code understanding at mid-range |
 | `lightweight` | phi3.5 | Edge/low-resource, ~4Gi RAM |
 | `minimal` | qwen2.5-coder:3b-instruct | CI pipelines / very constrained dev |
 
@@ -632,7 +634,8 @@ Composed with `modelTier` by `_helpers.tpl` to produce the final Ollama model ta
 `phi3.5` and `qwen2.5-coder:3b` use Ollama's default quantisation (already Q4), so no suffix is appended for `lightweight` and `minimal` tiers.
 
 Example compositions:
-- `balanced` + `q4_K_M` → `deepseek-coder-v2:16b-lite-instruct-q4_K_M` (~6Gi)
+- `heavy` + `q4_K_M` → `deepseek-coder-v2:16b-lite-instruct-q4_K_M` (~13Gi)
+- `balanced` (any quantisation) → `qwen2.5-coder:7b` (~4.5Gi; bare tag, no quant suffix)
 - `full` + `q8_0` → `mistral-nemo:12b-instruct-q8_0` (~12Gi)
 - `full` + `fp16` → `mistral-nemo:12b-instruct` (~14Gi)
 
@@ -826,7 +829,7 @@ Want model management / easy pulls     → ollama (default)
 |---|---|---|
 | ollama | full, balanced, lightweight, minimal | Default; model management included |
 | vllm | full, balanced | GPU required; high-throughput |
-| llamacpp | lightweight, minimal | CPU-native GGUF; lowest overhead |
+| llamacpp | lightweight, minimal (CPU); heavy (GPU, partial offload) | GGUF; lowest overhead; heavy tier verified on a 12 GB GPU with 24 offloaded layers |
 
 `lightweight` and `minimal` suppress the quantisation suffix (already Q4 by default), so llama-server receives e.g. `phi3.5` or `qwen2.5-coder:3b-instruct` as the served model name.
 
@@ -885,3 +888,189 @@ python test_pipeline.py smoke
 MODEL_TIER=minimal INFERENCE_BACKEND=llamacpp DEPLOYMENT_TARGET=local python test_pipeline.py
 ```
 
+---
+
+## Phase 19: `balanced` Tier Reverted — MoE VRAM Footprint ≠ Compute Cost
+
+### What happened
+
+`balanced` was changed from `qwen2.5-coder:7b` to `deepseek-coder-v2:16b-lite-instruct` on the reasoning that DeepSeek-Coder-V2-Lite's Mixture-of-Experts architecture is compute-efficient (~2.4B active parameters per token out of 16B total) and effective for polyglot codebases.
+
+That reasoning is true for **compute** but doesn't apply to **VRAM**. MoE VRAM footprint is dominated by total parameters, not active parameters — every expert has to sit resident in memory even though only a subset fires per token. A 16B MoE model costs roughly 16B-worth of VRAM regardless of how "lite" its per-token compute is. Verified in practice on a 12GB card: `ollama ps` showed `deepseek-coder-v2:16b-lite-instruct-q4_K_M` at 13GB, split `20%/80% CPU/GPU` — it didn't fit, and Ollama silently fell back to partial CPU offload rather than erroring. This produced a multi-minute hang with no visible error (compounded by the `num_ctx` fix in Phase 17/18-era work actually requesting the full 8192-token context for the first time, where previously the silent-2048-token default had been masking the problem by keeping the KV cache small enough to still barely fit).
+
+### Fix
+
+`balanced` reverted to `qwen2.5-coder:7b` (dense, ~4.5Gi at Q4), restoring the intended `heavy` (opt-in) > `full` (12B) > `balanced` (7B) > `lightweight` (3.8B) > `minimal` (3B) size ordering. `qwen2.5-coder:7b` also does **not** compose a quantisation suffix (joins `lightweight`/`minimal` in this respect) — no verified `qwen2.5-coder:7b-<quant>` Ollama tag was confirmed to exist, and guessing one risks reintroducing the exact "model not found" 404 class of bug this session spent considerable effort diagnosing and fixing (see Phase 17/18 test coverage). The bare tag is the one confirmed working, going back to the original `master`-branch design.
+
+DeepSeek-Coder-V2-Lite was **not discarded** — it now has its own explicit, separately-labelled `heavy` tier, above `full` in the dropdown, rather than silently occupying `balanced`'s slot. `heavy` *does* compose a quantisation suffix — `deepseek-coder-v2:16b-lite-instruct-q4_K_M` was empirically confirmed to exist and pull successfully during this session's testing (visible directly in `ollama ps` output), so unlike `balanced`'s case there's no guessing involved. `heavy` is explicit/opt-in specifically because its ~13GB footprint needs real VRAM headroom (16GB+) that a 12GB card doesn't have; the UI surfaces a warning when it's selected, both in the dropdown help text and in the active-override info banner, rather than letting the person rediscover the partial-CPU-offload hang the hard way.
+
+### Evolution of thinking — active parameters vs resident parameters
+
+The distinction that was missed: "lite" in an MoE model's name describes its *compute* cost, not its *memory* cost. This is a genuinely easy mistake to make when reasoning about model selection from benchmarks and architecture descriptions alone, without checking actual `ollama ps`/`nvidia-smi` output against real hardware. The concrete lesson for this project: tier definitions should be validated against actual VRAM measurements on representative hardware, not just parameter-count-weighted compute estimates — a gap that motivates the VRAM-fit capability check proposed as follow-up work (querying `ollama ps`'s size/processor split before committing to a hot-swap, rather than after).
+
+<!-- docs-update:phases-mlflow-helm -->
+---
+
+## Phase 20: Per-Question MLflow Runs and Automatic Deployment Defaults
+
+### Per-question runs
+
+**Problem.** The UI advances the LangGraph pipeline one node per Streamlit rerun (so the Pipeline tab can repaint), and a human-review pause can last minutes. MLflow's fluent API keeps the active run per thread, so a run opened with `with mlflow.start_run():` cannot span those reruns. Node-level `mlflow.log_*` calls then each opened a stray run, and run-level parameters were never set.
+
+**Decision.** `src/tracking.py` keeps one run open per question on the server and re-activates it for exactly the duration of each node:
+
+```
+run_id = tracking.start_query_run(...)        # once per question -> state["mlflow_run_id"]
+with tracking.activate(run_id): node(state)   # around every node (build_graph does this)
+tracking.finish_run(run_id, final_state)      # once: answered / rejected / failed
+```
+
+Every public function is failure tolerant: an unreachable or missing MLflow turns tracking into a no-op with one warning, and client calls fail fast so a dead server cannot stall a question. A run is the unit later used for backend x model evaluation (params, metrics and `result.json` per question, `eval.group` to group a batch).
+
+**Gotcha found on the real stack.** MLflow's allowed-hosts check returned 403 for the app's `mlflow:5000` Host header, silently. `--allowed-hosts` is now set in compose and generated in Helm.
+
+### Saving conversations
+
+A conversation can be downloaded as a Markdown transcript (thread, repositories, resolved model, messages). Since Phase 22 the transcript also carries the indexing outcome and each answer's pipeline trace, so a saved conversation shows which steps warned and what was retrieved, not only the answers.
+
+### Human review: three-way tool-plan rejection
+
+Rejecting a tool plan used to mean "stop". It is now **end**, **re-plan**, or **re-plan with feedback**, where the reviewer's note is handed to the planner. A cap (`MAX_REPLANS`) keeps a plan/reject loop finite, and each decision is logged on the question's run.
+
+### Automatic deployment defaults
+
+**Problem.** The "container default" backend and tier were whatever environment variables happened to be set, which drifted from what was actually running (start the llama.cpp profile with a heavy GGUF and the app still said Ollama / full).
+
+**Decision.** `src/deployment.py` is the single source of the container default. With `INFERENCE_BACKEND=auto` it probes the stack in priority order (llama-server, then vLLM, then Ollama), reads the served model from the server and infers the tier from the model name (first match wins, specific names first). Positive answers are cached for 20 s and misses for 4 s, so a server that starts later is noticed quickly. Explicit `INFERENCE_BACKEND` values pin the backend and Helm always sets one.
+
+**Placement finding.** An Ollama embedding model on the same 12 GB GPU as the resident heavy model collapsed llama-server throughput (132-177 tok/s down to under 7 until restart). `src/embedding.py` is the one place the embedding client is built and runs it on CPU by default (`EMBED_NUM_GPU`). Placement is a deployment variable on a par with `--n-gpu-layers`, and belongs in any backend x model evaluation.
+
+---
+
+## Phase 21: Helm Chart 0.2.0 — llama.cpp and GPUs on Kubernetes
+
+**Goal.** Reach compose parity on Kubernetes: the same backends, tiers and observability, composed from values rather than edited per environment.
+
+### What changed in the chart
+
+- The `dev` chart could not render at all: `app-deployment.yaml` used a `chunkingStrategy` helper `_helpers.tpl` did not define. Added.
+- `heavy` tier everywhere tiers are resolved (model tag, resources, context and timeout; llama.cpp + heavy gets a 180 s timeout).
+- llama.cpp as a first-class component: Deployment, Service, models volume (PVC, hostPath or existing claim), optional GGUF download init container, tier defaults mirroring compose, `extraArgs`, configurable startup probe.
+- `inferenceBackend: auto`; `llamacpp.enabled` / `vllm.enabled` deploy a backend beside Ollama for comparisons; the Ollama pod skips the chat-model pull unless Ollama may answer.
+- MLflow: generated `--allowed-hosts`, probes with a pinned Host header, configurable resources.
+- App env mirrors compose (`LLAMACPP_*`, `EMBED_NUM_GPU`, `MAX_REPLANS`, `MLFLOW_*`, `EVAL_GROUP`).
+
+### GPU access is a platform property, not a chart property
+
+The first question was whether the chart can be "platform independent". It can for everything except how a GPU reaches a container, so that is exposed as one small, explicit setting (`llamacpp.gpu.mode` / `wsl2`) rather than hidden. On a standard Linux GPU node the default (`nvidia.com/gpu` via the device plugin) just works. On Windows + WSL2 it does not, for reasons found one at a time:
+
+1. WSL2 exposes the GPU through `/dev/dxg` plus Windows driver libraries under `/usr/lib/wsl`, not through NVIDIA device nodes.
+2. Docker Desktop's built-in (kind) cluster cannot expose it. **minikube with the docker driver and `--gpus=all`** can: the node container sees the GPU and `nvidia-smi` works in it.
+3. The NVIDIA device plugin (v0.20.0) then fails NVML initialisation ("Not Supported"), so `nvidia.com/gpu` is never advertised. `gpu.mode=runtime` (container runtime injects the GPU, no resource request) avoids the plugin but still failed with `Failed to initialize NVML`.
+4. Root cause: nested containers do not receive `libdxcore.so`. Mounting the node's copy (`/usr/lib/x86_64-linux-gnu/libdxcore.so`, hostPath type File) into the container fixes it; this was verified by hand with a plain `docker run` in the node before being encoded as `gpu.wsl2=true`.
+
+Result: llama-server ran the heavy tier on the RTX 5070 Ti (about 10.4 GB VRAM in use) and answered through the app. Neither symlinks into `/usr/lib/wsl/lib` nor `--device /dev/dxg` helped.
+
+### Startup is storage-bound
+
+The first model load took about 15 minutes (cold read of a 10 GB file through the minikube volume) and exceeded the original 15-minute startup budget, so the pod was killed (exit 137) and restarted repeatedly. A warm load took 3.5 minutes. The budget is now `llamacpp.startupFailureThreshold` (default 180 x 10 s) rather than a constant.
+
+### Smaller findings
+
+- `--port={{ x | quote }}` renders literal quotes (`--port="5000"`) and crash-loops MLflow; the template is unquoted and a regression test covers it.
+- Windows downloads leave `:Zone.Identifier` files that Helm rejects; clean before every helm command.
+- Kubernetes has no `src/` bind mount: rebuild the image and `minikube image load` after code changes.
+- With Flash Attention reported as unsupported for this model on the CUDA build, attention falls back to the slower path; noted as a performance item.
+
+### How it was verified
+
+- `helm lint` and `helm upgrade` on a real install, and the full stack on a minikube GPU cluster: app, ChromaDB, MLflow, Ollama (embeddings) and llama.cpp all `Running`, a question answered through llama.cpp on the GPU, restart count 0 after the startup-budget change.
+- Because the `helm` binary was not available in the authoring sandbox, the chart is also covered by a stand-in Go-template renderer and ~100 render assertions (backend wiring, tier defaults, probe budgets, GPU modes, MLflow flags).
+
+### Not yet covered
+
+GPU scheduling on a real multi-node cluster with the device plugin (the default `resource` mode is rendered and tested, but not run), vLLM on the chart end to end, and per-model llama.cpp load settings read back from the server.
+
+---
+
+## Phase 22: Silent Failures — Awareness Across Layers
+
+**Goal.** A pipeline that *looks* like it works but has silently lost its retrieval must say so. This phase came from a real incident on the Kubernetes deployment.
+
+### The incident
+
+Questions were answered fluently, the Pipeline tab was green and MLflow logged a normal run, yet no Sources were cited and the answers were generic. Cause, found layer by layer:
+
+1. **Chart (init container).** The Ollama pod pulls the embedding model in an init container that started `ollama serve &`, slept a fixed 5 s, then ran `ollama pull`. The pull lost the race ("could not connect to ollama server"), but the script had no error handling, printed "Model pull complete." and exited 0. The pod was `Running` with an empty model store.
+2. **Indexing.** Every embedding call returned 404, so ingestion created the ChromaDB collections and stored **0 chunks**. `ensure_indexed` caught the exception and returned `status: "error"`, but the app ignored the status.
+3. **Retrieval.** `vector_search` over empty collections returned 0 chunks, which the trace still reported as `ok`. Context assembly produced `[No relevant context found]`, the LLM answered from nothing ("no specific information…") and the run was logged as answered.
+
+No layer raised, so the failure was invisible, and it could stop the whole pipeline's usefulness while every health signal stayed green. (The same applies to *any* empty retrieval: wrong collection, unreadable index, a question that matches nothing.)
+
+### What changed
+
+| Layer | Before | Now |
+|---|---|---|
+| Ollama init container | fixed sleep, no `set -e`, exit 0 on failed pull | waits for the server (up to 180 s), retries each pull 5x, **exits non-zero** on failure, and verifies the embedding model is listed before reporting completion |
+| `repo_index.ensure_indexed` | tried to ingest and swallowed the error | **preflight**: asks Ollama whether the embedding model exists (`embedding_ready`); an ingestion that stores 0 chunks is an error; errors carry a `hint` (the exact `ollama pull` command) |
+| App | continued after an indexing error | **hard stop**: shows the error and hint, does not run the pipeline, closes the MLflow run with `outcome=error`; also stops when every selected repo is empty |
+| `tool_execution` | `ok` regardless of hits | `warn` when `vector_search` ran but returned 0 chunks |
+| `context_assembly` | no trace entry; `break` dropped *every* chunk if the best one exceeded the budget | trace entry (chunks kept / dropped / truncated, tokens used of budget); an oversize first chunk is **truncated, not dropped**; sets `retrieval_empty` when nothing is left; `warn` when more than 30% of the retrieved chunks were dropped (`CONTEXT_DROP_WARN_FRACTION`) |
+| `generation` | called the LLM with an empty context | **skipped** when `retrieval_empty`: the answer states that nothing was retrieved, why (per-collection chunk counts) and what to check; metric `retrieval_empty=1` |
+| `output_review` | rated the non-answer (and could push a 5/5 into the preference profile) | skipped with a `warn` entry |
+| MLflow | outcome `answered` | outcome `no_retrieval` (or `error` for an indexing hard stop) |
+| UI | the 📂 indexing lines and the live progress vanished at the end of the run | indexing results persist in the chat; every answer carries a collapsible **Pipeline trace** with ⚠️ warnings; `warn` nodes are orange in the diagram |
+
+### Design notes
+
+- **Fail where the cause is, say it where the user looks.** The init container fails the pod (cause); the app turns the same condition into a message with the fix (symptom). Neither depends on the other.
+- **Warn is a status, not a log line.** `warn` flows through the trace, the diagram, the persisted answer and MLflow, so evaluation runs can filter on it.
+- **StatefulSet stays.** A Deployment would not remove the race (it is an init-script problem) and would give up the stable volume for the model store.
+- **Indexing is still blocking.** The first index of a repo embeds every chunk on the Ollama CPU (about 1,600 chunks per repo here) and can take minutes; the status box tells the user so and the per-chunk progress is in the app log. Running ingestion as a background job with visible progress is in `future_directions.md`.
+
+### Verified
+
+App-flow tests (real Streamlit `AppTest`, real graph) cover the hard stop (no LLM call, error shown, run closed as `error`), the empty-retrieval answer (warn entries, no sources, outcome `no_retrieval`) and the persistent trace. Chart-render tests check the init script (waits, retries, fails hard, verifies). On the real cluster the fixed init container pulled and verified `nomic-embed-text`, and indexed repos then produced cited answers from both repositories.
+
+---
+
+## Appendix: Reference Test Infrastructure
+
+Everything in Phases 21 and 22 was built and verified on one concrete rig. It is documented so the results are reproducible and so the parts that are specific to it are easy to adapt.
+
+### The rig
+
+| Layer | What | Notes |
+|---|---|---|
+| Hardware | Laptop, RTX 5070 Ti (12.2 GB VRAM) | about 10.4 GB used by the heavy tier |
+| OS | Windows 11 + WSL2 (Ubuntu) | WSL had about 11 GB RAM available |
+| Container runtime | Docker Desktop (WSL integration) | its built-in kind cluster cannot expose the GPU |
+| Cluster | minikube, docker driver, `--gpus=all` | the Kubernetes node is itself a container |
+| Chart | `helm/code-doc-assistant` 0.2.0 + `values-wsl2-minikube.yaml` | the preset holds everything specific to this rig |
+| Inference | llama.cpp `llama-server`, DeepSeek-Coder-V2-Lite Q4_K_M, `--ctx-size 4096`, 24 GPU layers | |
+| Embeddings | Ollama `nomic-embed-text` (CPU) | on the GPU it competes with llama-server for VRAM |
+
+### Layering and why it matters
+
+```mermaid
+flowchart TB
+    BROWSER["Windows browser\nlocalhost:8501 / :5000"] --> PROXY["socat proxy containers\n(Docker, --restart unless-stopped)"]
+    PROXY -->|"Docker network 'minikube'"| NODE["minikube node = a container\n(runs the Kubernetes node)"]
+    NODE --> SVC["NodePort services\n30501 app · 30500 MLflow"]
+    SVC --> PODS["pods: app · ChromaDB · MLflow\nOllama (embeddings) · llama-server (GPU)"]
+    GPU["RTX 5070 Ti\n/dev/dxg + libdxcore.so"] -.-> NODE
+```
+
+Nesting (Windows, WSL2, Docker, minikube node, pod) explains the platform-specific parts:
+- **GPU access:** WSL2 exposes the GPU as `/dev/dxg` plus Windows driver libraries. Nested containers do not get `libdxcore.so`, and the NVIDIA device plugin fails NVML, so the chart's `llamacpp.gpu.wsl2=true` uses runtime injection and mounts the node's copy (Phase 21).
+- **Reachability:** the node's IP lives on a Docker-internal network, so NodePorts are not reachable from Windows. Two `alpine/socat` containers on the `minikube` network publish fixed local ports (8501, 5000) and forward to the NodePorts by container name. They survive pod replacement, `helm upgrade` and reboots, unlike `kubectl port-forward`, which is bound to one pod. The alternative, `minikube start --ports=...`, needs the cluster recreated, which wipes the model volume.
+- **No bind mount:** app code changes need an image rebuild, a `minikube image load` under a new tag, and an upgrade with that tag (an image in use cannot be removed).
+- **Cold start:** the first load of the 10 GB model took about 15 minutes (storage-bound), a warm load about 3.5 minutes; the startup probe budget is configurable.
+- **Windows file markers:** `:Zone.Identifier` files and stray non-template files in `templates/` break `helm upgrade`.
+
+### Adapting it
+
+- **Linux GPU node:** drop the preset's `wsl2` line; the default `nvidia.com/gpu` resource mode (device plugin) applies. No proxies are needed: use NodePort or an Ingress.
+- **Docker Desktop kind, Docker Compose:** no GPU through kind; Compose is the simpler path on one machine (`docker compose`, see README).
+- **Smaller GPU:** lower `llamacpp.gpuLayers` or use a smaller tier; larger `--ctx-size` costs KV-cache VRAM (see `future_directions.md`).
+- **Other platforms:** keep the same checks: the model-pull init log shows the embedding model listed, `nvidia-smi` shows `llama-server` holding VRAM, the first question's trace shows `context_assembly` with sources.

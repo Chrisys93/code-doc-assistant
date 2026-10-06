@@ -1,0 +1,21 @@
+# Preset for the Windows + WSL2 + minikube (docker driver, --gpus=all) setup the chart was verified on.
+#   helm upgrade --install cda ./helm/code-doc-assistant -n code-doc --create-namespace \
+#     -f helm/code-doc-assistant/values-wsl2-minikube.yaml
+inferenceBackend: llamacpp
+modelTier: heavy
+llamacpp:
+  enabled: true
+  download:
+    enabled: true          # ~10 GB, first start only
+  gpu:
+    enabled: true
+    wsl2: true             # runtime GPU injection + libdxcore.so mount (device plugin does not work on WSL2)
+  startupFailureThreshold: 180   # 30 min; first (cold) load took ~15 min
+app:
+  service:
+    type: NodePort
+    nodePort: 30501        # Streamlit UI
+mlflow:
+  service:
+    type: NodePort
+    nodePort: 30500        # MLflow UI

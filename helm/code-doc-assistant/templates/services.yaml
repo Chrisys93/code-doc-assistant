@@ -69,19 +69,22 @@ metadata:
     {{- include "code-doc-assistant.labels" . | nindent 4 }}
     app.kubernetes.io/component: mlflow
 spec:
-  type: ClusterIP
+  type: {{ .Values.mlflow.service.type | default "ClusterIP" }}
   ports:
     - port: {{ .Values.mlflow.service.port }}
       targetPort: http
       protocol: TCP
       name: http
+      {{- if and (eq (.Values.mlflow.service.type | default "ClusterIP") "NodePort") .Values.mlflow.service.nodePort }}
+      nodePort: {{ .Values.mlflow.service.nodePort }}
+      {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
     app.kubernetes.io/component: mlflow
 {{- end }}
 ---
 # vLLM Service (dev branch — only when inferenceBackend=vllm)
-{{- if eq .Values.inferenceBackend "vllm" }}
+{{- if include "code-doc-assistant.vllmEnabled" . }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -99,4 +102,25 @@ spec:
   selector:
     app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
     app.kubernetes.io/component: vllm
+{{- end }}
+---
+# llama-server (llama.cpp) Service — when inferenceBackend=llamacpp or llamacpp.enabled
+{{- if include "code-doc-assistant.llamacppEnabled" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "code-doc-assistant.fullname" . }}-llamacpp
+  labels:
+    {{- include "code-doc-assistant.labels" . | nindent 4 }}
+    app.kubernetes.io/component: llamacpp
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.llamacpp.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
+    app.kubernetes.io/component: llamacpp
 {{- end }}
