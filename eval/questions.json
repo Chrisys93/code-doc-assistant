@@ -1,0 +1,416 @@
+{
+  "version": 1,
+  "repos": {
+    "cda": "https://github.com/Chrisys93/code-doc-assistant.git#dev",
+    "icarus": "https://github.com/Chrisys93/IcarusRepoSEND.git",
+    "ch3": "https://github.com/PaigeJu/chapter3.git"
+  },
+  "stages": {
+    "A": {
+      "repos": [
+        "cda",
+        "icarus"
+      ],
+      "note": "index the two original repos, ask Q1-Q6, Q10"
+    },
+    "B": {
+      "repos": [
+        "cda",
+        "icarus",
+        "ch3"
+      ],
+      "note": "add chapter3 (unrelated codebase), ask Q7-Q9, then re-ask the dilution probes"
+    }
+  },
+  "grading": {
+    "auto": "cite_any / cite_all: source files reported by the run; must_mention: each inner list is synonyms, at least one per list; must_not: any hit fails",
+    "manual": "0 = wrong or invented, 1 = partly right or ungrounded, 2 = right and grounded; scored by hand after the run, stored as the run metric manual_score",
+    "ungraded": "recorded and compared across configs, no pass/fail"
+  },
+  "questions": [
+    {
+      "id": "Q1",
+      "stage": "A",
+      "kind": "false_premise",
+      "question": "How are the hashes in IcarusRepoSEND related to the hashes of the embedding model in code-doc-assistant?",
+      "expected": "Corrects the premise: no relation. Icarus hashes are hash-routing (content name -> cache node). code-doc-assistant uses hashes only as bookkeeping (SHA-1 collection suffix, chunk de-duplication). The embedding model outputs vectors, not hashes.",
+      "cite_any": [
+        "icarus/models/strategy/hashrouting.py",
+        "config.py",
+        "src/repo_index.py",
+        "src/ingest.py"
+      ],
+      "must_mention": [
+        [
+          "routing",
+          "hashrouting",
+          "hash-routing",
+          "hash routing"
+        ],
+        [
+          "vector",
+          "embedding"
+        ]
+      ],
+      "must_not": [],
+      "grading": "auto+manual"
+    },
+    {
+      "id": "Q2",
+      "stage": "A",
+      "kind": "general_knowledge_plus_config",
+      "question": "Are positional encodings included in the vectors the embedding model returns in code-doc-assistant, and how do the output embedding formats differ between the embedding models it supports?",
+      "expected": "Positional information is applied inside the embedding transformer to the input tokens; the returned vector is one fixed-length pooled vector per text, with no separate positional part. Grounded part: the supported models and their dimensions come from src/config.py (nomic-embed-text 768, all-minilm 384, mxbai-embed-large 1024). The embedding model is separate from the inference LLMs. Differences beyond dimension (pooling, normalisation, prefixes, context length) are general knowledge, not in the repo.",
+      "cite_any": [
+        "src/config.py",
+        "src/embedding.py"
+      ],
+      "must_mention": [
+        [
+          "768"
+        ],
+        [
+          "384"
+        ],
+        [
+          "1024"
+        ]
+      ],
+      "must_not": [],
+      "grading": "auto+manual",
+      "note": "Q2 reformulated from the original wording (the original asked whether positional embeddings must be included in 'hashes')."
+    },
+    {
+      "id": "Q3",
+      "stage": "A",
+      "kind": "feasibility",
+      "question": "Can data storage hashes, mapped to different repos in IcarusRepoSEND, be mapped to potential embeddings, in the same format as code-doc-assistant produces, to potentially be used for in-context learning or, eventually, even fine-tuning towards task-relevant optimisation?",
+      "expected": "Yes in principle, with the caveat that a hash is an opaque digest with no semantic content: embed the content descriptors (name, size, popularity, source path) and keep the hash as the key. Format: fixed-dimension float vectors (768 for nomic-embed-text) in per-repo Chroma collections. In-context use is retrieval into the prompt; fine-tuning needs (descriptor, target) pairs.",
+      "cite_any": [
+        "src/vector_store.py",
+        "src/ingest.py",
+        "src/config.py",
+        "icarus/models/strategy/hashrouting.py"
+      ],
+      "must_mention": [
+        [
+          "chroma",
+          "vector store",
+          "vector_store"
+        ],
+        [
+          "retriev",
+          "in-context",
+          "context"
+        ]
+      ],
+      "must_not": [],
+      "grading": "auto+manual"
+    },
+    {
+      "id": "Q4",
+      "stage": "A",
+      "kind": "conceptual_mapping",
+      "question": "Associate IcarusRepoSEND with the appropriate network engineering and research principles that it uses and should consider.",
+      "expected": "Information-centric networking (ICN/CCN/NDN), in-network caching and cache placement/replacement policies, hash-routing, plus established systems ideas: CDNs, distributed storage, consistent hashing / DHTs, content popularity models.",
+      "cite_any": [
+        "icarus/models/cache/policies.py",
+        "icarus/models/strategy/hashrouting.py",
+        "icarus/scenarios/cacheplacement.py",
+        "icarus/scenarios/contentplacement.py"
+      ],
+      "must_mention": [
+        [
+          "information-centric",
+          "icn",
+          "ccn",
+          "ndn",
+          "named data"
+        ],
+        [
+          "cach"
+        ],
+        [
+          "distributed",
+          "storage",
+          "cdn",
+          "dht",
+          "consistent hash"
+        ]
+      ],
+      "must_not": [],
+      "grading": "auto+manual"
+    },
+    {
+      "id": "Q5",
+      "stage": "A",
+      "kind": "feasibility",
+      "question": "Could ML-based optimisation strategies be used for the IcarusRepoSEND simulated computer systems simulator?",
+      "expected": "Yes. Examples: learned cache replacement / placement (e.g. reinforcement learning), popularity prediction, and semantics-based embeddings plus optimisation over vectorised hashes/descriptors, referring to code-doc-assistant's embedding and vector-store parts.",
+      "cite_any": [
+        "icarus/models/cache/policies.py",
+        "icarus/scenarios/cacheplacement.py",
+        "src/vector_store.py",
+        "src/ingest.py"
+      ],
+      "must_mention": [
+        [
+          "yes",
+          "could",
+          "can be"
+        ],
+        [
+          "embedding",
+          "vector"
+        ],
+        [
+          "cach"
+        ]
+      ],
+      "must_not": [],
+      "grading": "auto+manual"
+    },
+    {
+      "id": "Q6",
+      "stage": "A",
+      "kind": "open_ended_next_steps",
+      "question": "What should the next steps be for the code-doc-assistant repository?",
+      "scope_note": "Question scopes retrieval to code-doc-assistant only (Icarus collection should not drive the answer).",
+      "expected": "Judged against docs/future_directions.md. Not pass/fail.",
+      "cite_any": [
+        "future_directions.md",
+        "ARCHITECTURE.md",
+        "README.md"
+      ],
+      "must_mention": [],
+      "must_not": [],
+      "grading": "ungraded",
+      "rubric": {
+        "recall": "how many items from future_directions.md the answer surfaces (eval runner, background indexing, health check, other llama.cpp tiers, vLLM on the chart, retrieval quality)",
+        "precision": "share of suggestions that name a real component or file in the repo",
+        "hallucination": "count of invented components, files or features",
+        "stale": "suggestions for things already implemented (preflight, indexing hard stop, NodePorts, trace saving)"
+      },
+      "scope": [
+        "cda"
+      ]
+    },
+    {
+      "id": "Q7",
+      "stage": "B",
+      "kind": "documentation_graph",
+      "question": "What are the files in this repository (chapter3) meant to be doing, mainly? Please provide a relational graph showing how they mainly interact, with a small functionality description for each.",
+      "expected": "Stata scripts for UKHLS data preparation (U1.1), GHQ descriptions (U1.2, U1.3), life-event IV analyses (U1.4-U1.7), heterogeneity and stress/transition analyses (U1.8-U1_10), wage-change IV, therapy waiting-time IV, and the iapt/ pipeline (clean data -> CCG-to-LSOA mapping -> LAD-month build -> descriptions, maps, residual IV). The outputs ind_ghq_lfs.dta and ghqevent.dta are the main hand-offs between scripts.",
+      "cite_any": [
+        "docs/script-index.md",
+        "ukhls/U1.1_indresp_ghq_lfs.do",
+        "iapt/build_IAPT_OSLAUA_month.do",
+        "ukhls/therapy_waitingtime_IV.do"
+      ],
+      "must_mention": [
+        [
+          "ukhls"
+        ],
+        [
+          "iapt"
+        ],
+        [
+          "ind_ghq_lfs",
+          "ghqevent"
+        ]
+      ],
+      "must_not": [],
+      "grading": "auto+manual",
+      "manual_checks": [
+        "graph is valid (mermaid or text arrows)",
+        "edges are supported by use/save/merge statements in the .do files, not guessed from names",
+        "every .do file in the repo appears or is explicitly grouped"
+      ]
+    },
+    {
+      "id": "Q8",
+      "stage": "B",
+      "kind": "dedup_refactor",
+      "question": "Which scripts in this repository (chapter3) duplicate each other's code or functionality, and how would you reorganise, refactor or de-duplicate them?",
+      "expected": "Partial, not total, duplication - checked with a CRLF-insensitive diff and line-set overlap. (1) ukhls/U1.1_indresp_ghq_lfs.do vs ..._keep_hidp.do: identical except 2 lines (1004-1005: `keep`/`order` also carry `hidp`); NOT a full duplicate, the answer should say what differs. (2) IAPT_claimant_count_preliminary(1).do exists in iapt/ and ukhls/ (~92% overlap): collapse construction differs, the iapt/ copy adds an `ssc install reghdfe` block and uses reghdfe (absorb lad_id mdate) where ukhls/ uses areg + i.mdate. (3) wage_change_iv_general_fixed.do vs ..._with_OLS.do (~80% overlap; the second adds an OLS comparison). (4) Copy-paste lineage among U1.5_lifeevent_IV_test, U1.6_lifeevent_IVchoice_deathascore and U1.7_dealingwith_missingGHQ (~50-60% shared lines; U1.7_dealingwith_missingGHQ is not a missing-data script only, it carries most of U1.6). Refactor: shared config for paths, shared prep include, one authoritative spec per analysis, options/flags instead of file copies.",
+      "cite_all": [
+        "ukhls/U1.1_indresp_ghq_lfs.do",
+        "ukhls/U1.1_indresp_ghq_lfs_keep_hidp.do"
+      ],
+      "cite_any": [
+        "iapt/IAPT_claimant_count_preliminary(1).do",
+        "ukhls/IAPT_claimant_count_preliminary(1).do",
+        "ukhls/wage_change_iv_general_fixed.do",
+        "ukhls/wage_change_iv_general_fixed_with_OLS.do",
+        "ukhls/U1.6_lifeevent_IVchoice_deathascore.do",
+        "ukhls/U1.7_dealingwith_missingGHQ.do"
+      ],
+      "must_mention": [
+        [
+          "hidp"
+        ],
+        [
+          "config",
+          "global",
+          "include",
+          "shared"
+        ]
+      ],
+      "must_not": [],
+      "grading": "auto+manual",
+      "note": "Overlap = share of identical non-comment lines (Jaccard on stripped lines, CR removed).",
+      "partial_duplicate_ground_truth": [
+        {
+          "files": [
+            "ukhls/U1.1_indresp_ghq_lfs.do",
+            "ukhls/U1.1_indresp_ghq_lfs_keep_hidp.do"
+          ],
+          "overlap": 0.99,
+          "diff": "2 lines (hidp in keep/order)"
+        },
+        {
+          "files": [
+            "iapt/IAPT_claimant_count_preliminary(1).do",
+            "ukhls/IAPT_claimant_count_preliminary(1).do"
+          ],
+          "overlap": 0.92,
+          "diff": "collapse construction; areg vs reghdfe; ssc install block"
+        },
+        {
+          "files": [
+            "ukhls/wage_change_iv_general_fixed.do",
+            "ukhls/wage_change_iv_general_fixed_with_OLS.do"
+          ],
+          "overlap": 0.8,
+          "diff": "OLS comparison added"
+        },
+        {
+          "files": [
+            "ukhls/U1.6_lifeevent_IVchoice_deathascore.do",
+            "ukhls/U1.7_dealingwith_missingGHQ.do"
+          ],
+          "overlap": 0.6,
+          "diff": "substantial shared blocks"
+        },
+        {
+          "files": [
+            "ukhls/U1.5_lifeevent_IV_test.do",
+            "ukhls/U1.7_dealingwith_missingGHQ.do"
+          ],
+          "overlap": 0.52,
+          "diff": "shared blocks"
+        },
+        {
+          "files": [
+            "ukhls/U1.5_lifeevent_IV_test.do",
+            "ukhls/U1.6_lifeevent_IVchoice_deathascore.do"
+          ],
+          "overlap": 0.47,
+          "diff": "shared blocks"
+        }
+      ],
+      "manual_checks": [
+        "states that the U1.1 pair differs (and how), instead of calling it a full duplicate",
+        "finds at least one duplicate pair that the README/script-index does NOT mention (U1.5/U1.6/U1.7 lineage, wage_change pair, IAPT_claimant_count pair) - if it only repeats the README, document reading is shallow"
+      ]
+    },
+    {
+      "id": "Q9",
+      "stage": "B",
+      "kind": "exhaustive_recall",
+      "question": "Which scripts in the chapter3 repository hard-code absolute Windows paths, and what would a shared configuration for them look like?",
+      "expected": "17 of the 25 .do files contain absolute C:/Users/... paths: 9 in iapt/ (0.clean data, 1.1_IAPT_raw_fig, 1.descp, 2.1_descp, 3.1map, CCG_month_to_LSOA11_complete, IAPT_LSOA_OSLAUA_residual_IV_complete(1), IAPT_claimant_count_preliminary(1), build_IAPT_OSLAUA_month) and 8 in ukhls/ (IAPT_claimant_count_preliminary(1), both U1.1 files, U1.7_master, U1.8, U1.9, U1_10, therapy_waitingtime_IV). The README only says 'several scripts'.",
+      "ground_truth_files": [
+        "iapt/0.clean data.do",
+        "iapt/1.1_IAPT_raw_fig.do",
+        "iapt/1.descp.do",
+        "iapt/2.1_descp.do",
+        "iapt/3.1map.do",
+        "iapt/CCG_month_to_LSOA11_complete.do",
+        "iapt/IAPT_LSOA_OSLAUA_residual_IV_complete(1).do",
+        "iapt/IAPT_claimant_count_preliminary(1).do",
+        "iapt/build_IAPT_OSLAUA_month.do",
+        "ukhls/IAPT_claimant_count_preliminary(1).do",
+        "ukhls/U1.1_indresp_ghq_lfs.do",
+        "ukhls/U1.1_indresp_ghq_lfs_keep_hidp.do",
+        "ukhls/U1.7_master_IV_selection_tests.do",
+        "ukhls/U1.8_supervisor_heterogeneity_transitions.do",
+        "ukhls/U1.9_stress_transition_equalweights.do",
+        "ukhls/U1_10_stress_complete.do",
+        "ukhls/therapy_waitingtime_IV.do"
+      ],
+      "cite_any": [],
+      "must_mention": [
+        [
+          "global",
+          "config",
+          "profile",
+          "include"
+        ]
+      ],
+      "must_not": [],
+      "grading": "auto+manual",
+      "metric": "file_recall = |named files in ground_truth_files| / 17 (automatic); precision (named files that really contain an absolute path) is checked by hand or by the judge",
+      "why": "Corner case: an exhaustive 'which files' question over 25 similar files tests top-k limits and context budget, not just relevance. A model that repeats the README's 'several scripts' without naming files fails the recall."
+    },
+    {
+      "id": "Q10",
+      "stage": "A",
+      "kind": "ambiguity_cross_repo",
+      "question": "What does config.py configure, and which settings matter most?",
+      "expected": "Ambiguous on purpose: both code-doc-assistant (src/config.py: embedding model and dimension, Chroma host, model tiers, context budget) and IcarusRepoSEND (config.py: simulation settings, strategies including hash-routing, topologies, cache placement) have a config.py. A good answer separates them by repo, or says it is ambiguous; a merged or single-repo answer that does not say which repo is wrong.",
+      "cite_all": [
+        "src/config.py",
+        "config.py"
+      ],
+      "must_mention": [
+        [
+          "icarus",
+          "simulat"
+        ],
+        [
+          "embedding",
+          "chroma",
+          "llm",
+          "model"
+        ]
+      ],
+      "must_not": [],
+      "grading": "auto+manual",
+      "why": "Corner case: same filename in two collections. Tests multi-collection retrieval and whether sources are attributed to the right repo."
+    }
+  ],
+  "dilution_probes": [
+    {
+      "id": "Q1_rerun",
+      "stage": "B",
+      "rerun_of": "Q1",
+      "note": "same question after chapter3 is indexed; compare score, sources and retrieved-chunk repo mix against stage A"
+    },
+    {
+      "id": "Q4_rerun",
+      "stage": "B",
+      "rerun_of": "Q4",
+      "note": "same as above"
+    },
+    {
+      "id": "Q10_rerun",
+      "stage": "B",
+      "rerun_of": "Q10",
+      "note": "same as above; checks whether Stata chunks displace the two config.py files"
+    }
+  ],
+  "run_params_to_record": [
+    "backend",
+    "server_model_gguf",
+    "quantisation",
+    "ctx_size",
+    "n_gpu_layers",
+    "flash_attention",
+    "top_k",
+    "context_budget_tokens",
+    "embedding_model",
+    "embedding_dimension",
+    "planner_args_ignored_count"
+  ]
+}

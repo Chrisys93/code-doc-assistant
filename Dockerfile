@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY src/ ./src/
 
+# Evaluation tooling (questions, runner, bench): run inside the pod with `python /app/eval/run_eval.py`
+COPY eval/ ./eval/
+
 # Ensure src is importable as a package
 ENV PYTHONPATH=/app:/app/src
 

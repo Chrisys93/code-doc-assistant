@@ -74,6 +74,16 @@ TEXT_EXTENSIONS = {
     ".md", ".txt", ".rst", ".yaml", ".yml", ".toml",
     ".json", ".xml", ".html", ".css", ".sql", ".sh",
     ".bash", ".dockerfile", ".env", ".cfg", ".ini", ".conf",
+    # Languages with no tree-sitter grammar here (Stata, SAS, SPSS, Julia): plain-text chunking.
+    ".do", ".ado", ".mata", ".sas", ".sps", ".jl",
+}
+
+# Extensions that are never source: not reported as "skipped code" by skipped_source_files().
+_NON_SOURCE_EXTENSIONS = {
+    "", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf", ".zip", ".gz", ".tar", ".tgz",
+    ".lock", ".csv", ".tsv", ".dta", ".rds", ".rdata", ".xlsx", ".xls", ".docx", ".pptx",
+    ".parquet", ".pkl", ".bin", ".pt", ".onnx", ".gguf", ".woff", ".woff2", ".ttf", ".eot",
+    ".mp3", ".mp4", ".mov", ".gitignore", ".gitattributes", ".log", ".out", ".pyc", ".so", ".dll",
 }
 
 # Directories to skip during file discovery
@@ -144,6 +154,25 @@ def discover_files(repo_path: str) -> list[dict]:
         f"{sum(1 for f in files if f['type'] == 'text')} text/config)"
     )
     return files
+
+
+def skipped_source_files(repo_path: str, min_files: int = 3) -> dict[str, int]:
+    """
+    Extensions present in the repo that discover_files() ignores, with their file counts.
+
+    A repo whose real code is in a language we do not index would otherwise be embedded from its
+    README alone and answer plausibly but ungrounded. Extensions with fewer than `min_files`
+    files and obvious non-source types (images, data, archives) are left out.
+    """
+    counts: dict[str, int] = {}
+    for root, dirs, filenames in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in filenames:
+            ext = Path(fname).suffix.lower()
+            if ext in LANGUAGE_MAP or ext in TEXT_EXTENSIONS or ext in _NON_SOURCE_EXTENSIONS:
+                continue
+            counts[ext] = counts.get(ext, 0) + 1
+    return {e: n for e, n in sorted(counts.items(), key=lambda kv: -kv[1]) if n >= min_files}
 
 
 def load_and_chunk_files(files: list[dict]) -> list:

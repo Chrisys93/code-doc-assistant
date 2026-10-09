@@ -146,10 +146,10 @@ def ensure_indexed(repos: list[str], chroma_host: str,
                                     "docs": 1387, "status": "already_indexed"}}
     """
     try:
-        from src.ingest import ingest_codebase
+        from src.ingest import ingest_codebase, skipped_source_files
         from src.vector_store import ChromaVectorStoreImpl
     except ImportError:
-        from ingest import ingest_codebase
+        from ingest import ingest_codebase, skipped_source_files
         from vector_store import ChromaVectorStoreImpl
 
     results: dict[str, dict] = {}
@@ -184,6 +184,16 @@ def ensure_indexed(repos: list[str], chroma_host: str,
             else:
                 results[ref] = {"collection": coll, "docs": docs,
                                 "status": "reindexed" if force else "ingested"}
+                try:
+                    skipped = skipped_source_files(path)
+                except Exception:
+                    skipped = {}
+                if skipped:
+                    results[ref]["skipped"] = skipped
+                    results[ref]["warning"] = (
+                        "not indexed (unsupported file types): "
+                        + ", ".join(f"{e} x{n}" for e, n in skipped.items())
+                        + " - answers about these files will not be grounded in them")
         except Exception as e:
             logger.exception("ensure_indexed failed for %s", ref)
             results[ref] = {"collection": coll, "docs": n, "status": "error", "error": str(e), "hint": _hint(str(e))}

@@ -47,6 +47,7 @@ def _init():
         "awaiting_output_review": False,
         "last_run_id": None,
         "last_trace": [],          # execution_trace from last completed query
+        "trace_log": [],           # one entry per answered question: question, run id, trace (saved separately from the chat)
         "last_adjustments": [],
         "session_preferences": None,
         "agent_state": None,
@@ -90,8 +91,14 @@ def _finalise(state: dict) -> None:
     srcs = state.get("source_attribution", [])
     if srcs:
         rt += "\n\n---\n**Sources:** " + ", ".join(f"`{s}`" for s in srcs)
-    st.session_state.messages.append({"role": "assistant", "content": rt,
-                                      "trace": list(state.get("execution_trace", []))})
+    tr = list(state.get("execution_trace", []))
+    warns = sum(1 for t in tr if t.get("status") == "warn")
+    st.session_state.messages.append({"role": "assistant", "content": rt, "warnings": warns})
+    question = next((m["content"] for m in reversed(st.session_state.messages) if m["role"] == "user"), "")
+    st.session_state.trace_log.append({
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"), "question": question,
+        "run_id": state.get("mlflow_run_id"), "model": state.get("active_model"),
+        "backend": state.get("active_backend"), "sources": list(srcs), "trace": tr})
     st.session_state.last_run_id = state.get("mlflow_run_id")
     st.session_state.last_adjustments = state.get("supervisor_adjustments", [])
     st.session_state.last_trace = state.get("execution_trace", [])
@@ -211,9 +218,43 @@ def _export_conversation_markdown() -> str:
         "---",
         "",
     ]
+    notes: list[str] = []                        # indexing results belong to the assistant's reply
     for msg in st.session_state.messages:
-        speaker = "🧑 You" if msg["role"] == "user" else "🤖 Assistant"
-        lines.append(f"**{speaker}:**\n\n{msg['content']}\n")
+        if msg.get("kind") == "index":
+            notes.append("\n".join(f"> {ln}" for ln in msg["content"].splitlines()))
+            continue
+        speaker = "🧑 User" if msg["role"] == "user" else "🤖 Assistant"
+        if msg["role"] == "user":
+            lines.append(f"**{speaker}:**\n\n{msg['content']}\n")
+        else:
+            body = "\n>\n".join(notes) + "\n\n" if notes else ""
+            lines.append(f"**{speaker}:**\n\n{body}{msg['content']}\n")
+            notes = []
+    if notes:                                    # indexing finished but no reply was produced
+        lines.append("**🤖 Assistant:**\n\n" + "\n>\n".join(notes) + "\n")
+    return "\n".join(lines)
+
+
+def _export_trace_markdown() -> str:
+    """The pipeline trace of every answered question in this thread, kept apart from the conversation."""
+    icon = {"ok": "✅", "retry": "🔄", "warn": "⚠️"}
+    lines = [
+        f"# Pipeline trace — {st.session_state.thread_id}",
+        "",
+        f"- **Repos:** {', '.join(st.session_state.get('repos', [])) or '(none)'}",
+        f"- **Exported:** {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "- The same trace is stored on each question's MLflow run (`result.json`).",
+        "",
+    ]
+    for i, e in enumerate(st.session_state.get("trace_log", []), 1):
+        lines += [f"## {i}. {e['question']}", "",
+                  f"- **Time:** {e['time']}",
+                  f"- **MLflow run:** `{e.get('run_id') or 'not recorded'}`",
+                  f"- **Model:** {e.get('model') or '?'} ({e.get('backend') or '?'})",
+                  f"- **Sources:** {', '.join(f'`{x}`' for x in e.get('sources', [])) or 'none'}", ""]
+        lines += [f"{n}. {icon.get(t.get('status'), '❌')} **{t.get('node')}** — {t.get('detail', '')}"
+                  for n, t in enumerate(e["trace"], 1)]
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -432,13 +473,13 @@ with st.expander("⚙️ Configuration", expanded=False):
             icon="ℹ️",
         )
 
-    btn_cols = st.columns([1, 1, 5])
+    btn_cols = st.columns([1, 1, 1, 4])
     with btn_cols[0]:
         if st.button("🗑️ Clear conversation"):
             _end_run(outcome="abandoned")
             for k, v in {"messages": [], "pending_hitl": None, "awaiting_hitl": False,
                          "pending_output_review": None, "awaiting_output_review": False,
-                         "last_run_id": None, "last_trace": [], "last_adjustments": [],
+                         "last_run_id": None, "last_trace": [], "trace_log": [], "last_adjustments": [],
                          "session_preferences": None, "agent_state": None,
                          "last_error": None, "streaming_active": False, "running_node": None,
                          "pending_init": None, "pending_resume": None, "replan_round": 0}.items():
@@ -455,6 +496,16 @@ with st.expander("⚙️ Configuration", expanded=False):
             help="Downloads the full transcript as Markdown. This is currently "
                  "the only way to keep a conversation — nothing is auto-persisted "
                  "beyond what's needed to resume the live session.",
+        )
+    with btn_cols[2]:
+        st.download_button(
+            "🧭 Save trace",
+            data=_export_trace_markdown(),
+            file_name=f"{st.session_state.thread_id}-trace.md",
+            mime="text/markdown",
+            disabled=not st.session_state.get("trace_log"),
+            help="Downloads the pipeline trace of every answered question (steps, warnings, sources, "
+                 "MLflow run id) as a separate file. The conversation transcript does not contain it.",
         )
 
 # ---------------------------------------------------------------------------
@@ -550,22 +601,27 @@ with tab_chat:
                 st.session_state.last_error = None
                 st.rerun()
 
-    _ICON = {"ok": "✅", "retry": "🔄", "warn": "⚠️"}
+    pending_notes: list[str] = []                # indexing results are shown inside the assistant's bubble
     for msg in st.session_state.messages:
-        if msg.get("kind") == "index":          # repo indexing outcome: stays visible after the answer
-            st.caption(msg["content"])
+        if msg.get("kind") == "index":
+            pending_notes.append(msg["content"])
             continue
         with st.chat_message(msg["role"]):
+            if msg["role"] != "user":
+                for n in pending_notes:
+                    st.caption(n)
+                pending_notes = []
             if msg.get("kind") == "error":
                 st.error(msg["content"])
             else:
                 st.markdown(msg["content"])
-            if msg.get("trace"):
-                warns = sum(1 for t in msg["trace"] if t.get("status") == "warn")
-                with st.expander(f"Pipeline trace ({len(msg['trace'])} steps"
-                                 + (f", ⚠️ {warns} warning(s)" if warns else "") + ")"):
-                    for t in msg["trace"]:
-                        st.markdown(f"{_ICON.get(t.get('status'), '❌')} **{t.get('node')}** — {t.get('detail', '')}")
+        if msg.get("warnings"):
+            st.caption(f"⚠️ {msg['warnings']} pipeline warning(s) for this answer — see the 🔗 Pipeline tab "
+                       "or **🧭 Save trace**.")
+    if pending_notes:                            # a run is in progress: no reply yet
+        with st.chat_message("assistant"):
+            for n in pending_notes:
+                st.caption(n)
 
     if st.session_state.streaming_active:
         st.info(f"⏳ Agent running — now executing `{st.session_state.running_node or '…'}`. "
@@ -638,13 +694,16 @@ with tab_chat:
                 _failed = {r: x for r, x in status.items() if x["status"] == "error"}
                 for ref, x in status.items():
                     st.write(f"📂 {ref.split('/')[-1]} → {x['status']} ({x['docs']} docs)")
+                    if x.get("warning"):
+                        st.write(f"⚠️ {x['warning']}")
                 _ix.update(label="Indexing failed" if _failed else "Repos indexed",
                            state="error" if _failed else "complete", expanded=bool(_failed))
             st.session_state.active_collections = active_collections(st.session_state.get("repos", []))
             for ref, x in status.items():           # persisted as messages: a bare st.caption vanishes on rerun
                 icon = "❌" if x["status"] == "error" else "📂"
                 st.session_state.messages.append({"role": "assistant", "kind": "index",
-                    "content": f"{icon} {ref.split('/')[-1]} → {x['status']} ({x['docs']} docs)"})
+                    "content": f"{icon} {ref.split('/')[-1]} → {x['status']} ({x['docs']} docs)"
+                               + (f"\n⚠️ {x['warning']}" if x.get("warning") else "")})
             _no_docs = [r for r, x in status.items() if x["docs"] == 0]
             _hard = bool(_failed) or (bool(status) and len(_no_docs) == len(status))
 

@@ -262,9 +262,14 @@ Two review points, both optional (`HITL_ENABLED`, `OUTPUT_REVIEW_MODE`, and live
 
 Every decision is logged on the question's MLflow run (see [Observability](#observability-mlflow)).
 
-#### Saving a conversation
+#### Saving a conversation and its trace
 
-The **💾 Save conversation** button in the sidebar downloads the whole conversation as a Markdown transcript: thread id, repositories in scope, the resolved model, every message, the indexing result for each repository and, under each answer, its pipeline trace (including ⚠️ warnings). Nothing else persists a conversation in a directly usable form; MLflow keeps each question's response and `result.json` per run.
+Two separate downloads in the sidebar:
+
+- **💾 Save conversation**: the transcript as Markdown (thread id, repositories, resolved model, every message, with the indexing result per repository shown inside the assistant's reply). It contains no pipeline trace.
+- **🧭 Save trace**: the pipeline trace of every answered question in the thread (steps, ⚠️ warnings, sources, model, MLflow run id), also as Markdown.
+
+The same trace is stored on each question's MLflow run in `result.json`. The chat itself shows only the answer; an answer with pipeline warnings gets one short note pointing to the 🔗 Pipeline tab and the saved trace.
 
 #### Automatic deployment defaults
 
@@ -522,7 +527,7 @@ A pipeline can look healthy while retrieval is silently empty, for example when 
 - **After retrieval**, if nothing was found, generation is skipped and the answer says so, with the chunk count per collection. The trace shows ⚠️ warnings and MLflow records `outcome=no_retrieval`.
 - Context assembly flags a retrieval where more than 30% of the chunks did not fit the model's window (`CONTEXT_DROP_WARN_FRACTION`) with a ⚠️.
 - The **Ollama init container** (Helm) waits for the server, retries the pull and fails the pod if the embedding model is not present, instead of reporting success.
-- Indexing results and each answer's **Pipeline trace** stay visible in the chat after the run.
+- Indexing results stay visible in the chat after the run. The per-answer pipeline trace is kept out of the conversation: it is on the 🔗 Pipeline tab, in **🧭 Save trace** and on the MLflow run; an answer with warnings gets one short note.
 
 If you see a ⚠️ in the trace or an "Indexing failed" message, check `kubectl -n <ns> logs <ollama-pod> -c model-pull` (or `docker compose logs ollama`) first. The first index of a repo is slow (embeddings run on the Ollama CPU); follow `Generating embeddings x/N` in the app log.
 

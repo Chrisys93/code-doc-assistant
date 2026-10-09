@@ -55,6 +55,12 @@ spec:
             # Only the FALLBACK name: the app reads the real one from llama-server.
             - name: LLAMACPP_MODEL
               value: {{ include "code-doc-assistant.llamacppServedName" . | quote }}
+            # The --ctx-size the server is launched with (same helper as the server's flag), so the app
+            # budgets its prompt against the real window even when GET /props cannot be read.
+            - name: LLAMACPP_CTX
+              value: {{ include "code-doc-assistant.llamacppCtx" . | quote }}
+            - name: LLAMACPP_MAX_TOKENS
+              value: {{ .Values.llamacpp.maxTokens | quote }}
             {{- end }}
             - name: EMBED_NUM_GPU
               value: {{ .Values.embedNumGpu | quote }}

@@ -1,3 +1,6 @@
+{{- /* gpu.wsl2 implies runtime mode: the NVIDIA device plugin cannot see a WSL2 GPU */ -}}
+{{- $gpu := .Values.ollama.gpu -}}
+{{- $runtime := or (eq ($gpu.mode | default "resource") "runtime") $gpu.wsl2 -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -18,6 +21,9 @@ spec:
         app.kubernetes.io/name: {{ include "code-doc-assistant.name" . }}
         app.kubernetes.io/component: ollama
     spec:
+      {{- if and $gpu.enabled $gpu.runtimeClassName }}
+      runtimeClassName: {{ $gpu.runtimeClassName | quote }}
+      {{- end }}
       containers:
         - name: ollama
           image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
@@ -30,16 +36,36 @@ spec:
               value: "0.0.0.0"
             - name: OLLAMA_MODEL
               value: {{ include "code-doc-assistant.ollamaModel" . }}
+            {{- if and $gpu.enabled $runtime }}
+            # gpu.mode=runtime (or wsl2): no nvidia.com/gpu request; the node's NVIDIA container
+            # runtime injects the GPU because of these variables. Same mechanism as llamacpp.gpu.
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+            {{- end }}
             {{- $inferenceConfig := include "code-doc-assistant.inferenceConfig" . | fromYaml }}
             {{- range $key, $value := $inferenceConfig }}
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
           resources:
+            {{- if and $gpu.enabled (not $runtime) (eq (.Values.deploymentTarget | default "local") "local") }}
+            limits:
+              nvidia.com/gpu: 1
+            {{- else }}
             {{- include "code-doc-assistant.ollamaResources" . | nindent 12 }}
+            {{- end }}
           volumeMounts:
             - name: ollama-data
               mountPath: /root/.ollama
+            {{- if and $gpu.enabled $gpu.wsl2 }}
+            # WSL2: the NVIDIA runtime nested inside the node does not inject libdxcore.so, so NVML
+            # fails with "Not Supported". Mount the node's copy in (same as llamacpp.gpu.wsl2).
+            - name: wsl-libdxcore
+              mountPath: {{ $gpu.libdxcorePath | default "/usr/lib/x86_64-linux-gnu/libdxcore.so" | quote }}
+              readOnly: true
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /api/tags
@@ -96,6 +122,13 @@ spec:
               mountPath: /root/.ollama
           resources:
             {{- include "code-doc-assistant.ollamaResources" . | nindent 12 }}
+      {{- if and $gpu.enabled $gpu.wsl2 }}
+      volumes:
+        - name: wsl-libdxcore
+          hostPath:
+            path: {{ $gpu.libdxcorePath | default "/usr/lib/x86_64-linux-gnu/libdxcore.so" | quote }}
+            type: File
+      {{- end }}
   {{- if .Values.ollama.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:

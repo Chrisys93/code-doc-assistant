@@ -1,0 +1,48 @@
+{
+  "configs": {
+    "llamacpp-heavy": {
+      "backend": "llamacpp",
+      "tier": "heavy",
+      "env": {},
+      "note": "DeepSeek-Coder-V2-Lite Q4_K_M; chart default ctx 4096, 24 GPU layers. Deploy: helm upgrade ... --set modelTier=heavy"
+    },
+    "llamacpp-full": {
+      "backend": "llamacpp",
+      "tier": "full",
+      "env": {},
+      "note": "Mistral-Nemo-12B Q4_K_M; chart default ctx 8192, all layers on GPU. Deploy: helm upgrade ... --set modelTier=full (the runner refuses if the server runs another tier)"
+    },
+    "ollama-heavy": {
+      "backend": "ollama",
+      "tier": "heavy",
+      "env": {},
+      "note": "CPU-ONLY unless the Ollama pod has been given the GPU (the chart does not do this yet); check cold_start residency / ollama_vram_fraction"
+    },
+    "ollama-full": {
+      "backend": "ollama",
+      "tier": "full",
+      "env": {},
+      "note": "Same GPU caveat as ollama-heavy"
+    },
+    "strata-heavy": {
+      "backend": "strata",
+      "tier": "heavy",
+      "env": {},
+      "note": "NOT IMPLEMENTED: placeholder for the Strata spike (OpenAI-compatible, MoE only; its DeepSeek-V2-Lite is not the same model as DeepSeek-Coder-V2-Lite)"
+    },
+    "llamacpp-heavy-topk5": {
+      "backend": "llamacpp",
+      "tier": "heavy",
+      "env": {
+        "TOP_K": "5"
+      },
+      "note": "Same server, smaller retrieval"
+    },
+    "vllm": {
+      "backend": "vllm",
+      "tier": "full",
+      "env": {},
+      "note": "Placeholder until vLLM is enabled on the chart"
+    }
+  }
+}

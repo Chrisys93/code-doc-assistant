@@ -111,6 +111,16 @@ LLAMACPP_HOST = os.environ.get("LLAMACPP_HOST", "http://localhost:8081")
 # _llamacpp_served_model() -- because llama-server serves whichever GGUF it was launched
 # with (its -a alias, or the GGUF filename stem) and ignores the request's `model` field.
 LLAMACPP_MODEL = os.environ.get("LLAMACPP_MODEL", "mistral-nemo-instruct-2407-q4_k_m")
+# The --ctx-size llama-server was LAUNCHED with, passed by the chart from the very value that sets the
+# server's flag. It is the fallback when GET /props cannot be read (server busy or swapping), so the
+# context budget never silently falls back to the tier table (heavy = 8192) while the server holds 4096.
+LLAMACPP_CTX = int(os.environ.get("LLAMACPP_CTX", "0") or 0)
+# Cap on generated tokens for llamacpp. It used to equal the whole window (4096), so one rambling answer
+# could run for the whole time budget; keep it well below the window.
+LLAMACPP_MAX_TOKENS = int(os.environ.get("LLAMACPP_MAX_TOKENS", "1024"))
+# Characters per token used to turn the token budget into a character budget. Code tokenises at roughly
+# 3 chars/token, so the previous 4 under-counted and could overshoot the window.
+CHARS_PER_TOKEN = float(os.environ.get("CHARS_PER_TOKEN", "3.0"))
 
 # Output review mode — controls post-generation quality gate behaviour.
 # "human"      → HITL-2: interrupt and wait for human rating + decision
@@ -183,11 +193,13 @@ OLLAMA_NUM_CTX = int(os.environ.get(
 
 def _llamacpp_props() -> dict | None:
     """The running llama-server's own description of itself (GET /props), or None."""
-    try:
-        import requests
-        return requests.get(f"{LLAMACPP_HOST}/props", timeout=3).json()
-    except Exception:
-        return None
+    import requests
+    for _ in range(2):   # a busy or swapping server can miss a short timeout once
+        try:
+            return requests.get(f"{LLAMACPP_HOST}/props", timeout=8).json()
+        except Exception:
+            continue
+    return None
 
 
 def _llamacpp_server_ctx() -> int | None:
@@ -234,14 +246,28 @@ def _llamacpp_served_model(max_age_s: float = 30.0) -> str | None:
     return name or _SERVED_MODEL_CACHE["name"]
 
 
-def _effective_ctx_window(state: "AgentState") -> int:
-    """Context window the answering model really has, for context budgeting."""
+def _effective_ctx_info(state: "AgentState") -> tuple[int, str]:
+    """(context window the answering model really has, where that number came from).
+
+    llamacpp: the smaller of what the server reports (GET /props) and what it was launched with
+    (LLAMACPP_CTX, set by the chart). Only when neither is known does it fall back to the tier table,
+    and the source then says so -- the tier table (heavy = 8192) does not describe a llama-server that
+    was started with --ctx-size 4096.
+    """
     backend = (state.get("active_backend") or _default_backend() or "").lower()
     if backend == "llamacpp":
-        n = _llamacpp_server_ctx()
-        if n:
-            return n
-    return _resolve_ctx_for_tier(state.get("active_model_tier"))
+        server = _llamacpp_server_ctx()
+        known = [n for n in (server, LLAMACPP_CTX) if n]
+        if known:
+            src = "server+config" if (server and LLAMACPP_CTX) else ("server" if server else "config")
+            return min(known), src
+        return _resolve_ctx_for_tier(state.get("active_model_tier")), "tier-table-UNVERIFIED"
+    return _resolve_ctx_for_tier(state.get("active_model_tier")), "tier-table"
+
+
+def _effective_ctx_window(state: "AgentState") -> int:
+    """Context window the answering model really has, for context budgeting."""
+    return _effective_ctx_info(state)[0]
 
 
 def _resolve_ctx_for_tier(tier: str | None) -> int:
@@ -476,7 +502,7 @@ def _get_llm(
             # full tier (mistral-nemo, 8192 ctx) benefits from more generous
             # output headroom than the old 2048 default, which was sized for
             # the tiny minimal-tier model this used to point at.
-            max_tokens=4096,
+            max_tokens=LLAMACPP_MAX_TOKENS,
         )
     # Default: Ollama
     resolved_model = model or (
@@ -992,7 +1018,7 @@ def node_context_assembly(state: AgentState) -> dict[str, Any]:
     # num_ctx was correctly wired into _get_llm() — the retrieved-context
     # budget alone could still exceed what's left after the system prompt.
     # Retrieved context gets ~60% of the window; the remainder is reserved.
-    ctx_window = _effective_ctx_window(state)
+    ctx_window, ctx_src = _effective_ctx_info(state)
     budget_tokens = min(MAX_CONTEXT_TOKENS, int(ctx_window * 0.6))
 
     # Deduplicate by content hash, preserving arrival order.
@@ -1012,8 +1038,8 @@ def node_context_assembly(state: AgentState) -> dict[str, Any]:
             seen.add(h)
             unique.append(c)
 
-    # Trim to context window (rough token estimate: 1 token ≈ 4 chars)
-    max_chars = budget_tokens * 4
+    # Trim to context window (rough token estimate: 1 token ≈ CHARS_PER_TOKEN chars, 3 for code)
+    max_chars = int(budget_tokens * CHARS_PER_TOKEN)
     context_parts: list[str] = []
     source_files: list[str] = []
     total_chars = 0
@@ -1041,8 +1067,8 @@ def node_context_assembly(state: AgentState) -> dict[str, Any]:
     final_context = "\n".join(context_parts) if context_parts else "[No relevant context found]"
     empty = included == 0
     detail = (f"NOTHING retrieved: 0 chunks reached context assembly (generation will be skipped)" if empty else
-              f"{included}/{len(unique)} chunk(s) in context (~{total_chars // 4} of {budget_tokens} budget tokens, "
-              f"model window {ctx_window})"
+              f"{included}/{len(unique)} chunk(s) in context (~{int(total_chars / CHARS_PER_TOKEN)} of {budget_tokens} budget tokens, "
+              f"model window {ctx_window} [{ctx_src}])"
               + (f", {dropped} dropped for budget" if dropped else "")
               + (f", {truncated} truncated" if truncated else "")
               + f"; sources: {len(source_files)}")
@@ -1052,7 +1078,12 @@ def node_context_assembly(state: AgentState) -> dict[str, Any]:
     if heavy_drop:
         detail += (f" | WARNING: more than {int(CONTEXT_DROP_WARN_FRACTION * 100)}% of the retrieved chunks "
                    "did not fit (small context window, or oversize chunks)")
-    trace.append({"node": "context_assembly", "status": "warn" if (empty or heavy_drop) else "ok", "detail": detail})
+    unverified = ctx_src.endswith("UNVERIFIED")
+    if unverified:
+        detail += (" | WARNING: llama-server's context window could not be read (/props) and LLAMACPP_CTX is "
+                   "unset; the budget uses the tier table and may exceed the real window")
+    trace.append({"node": "context_assembly", "status": "warn" if (empty or heavy_drop or unverified) else "ok",
+                  "detail": detail})
     return {"final_context": final_context, "source_attribution": source_files,
             "retrieval_empty": empty, "execution_trace": trace}
 

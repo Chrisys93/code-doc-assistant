@@ -33,6 +33,12 @@ spec:
             - --port={{ .Values.mlflow.service.port }}
             - --backend-store-uri={{ .Values.mlflow.backendStoreUri }}
             - --default-artifact-root={{ .Values.mlflow.defaultArtifactRoot }}
+            {{- if .Values.mlflow.serveArtifacts }}
+            # Proxy artifact access through the server. With a plain-path artifact root the CLIENT (the app pod)
+            # writes artifacts to its own filesystem and the UI's Artifacts tab stays empty.
+            - --serve-artifacts
+            - --artifacts-destination={{ .Values.mlflow.artifactsDestination }}
+            {{- end }}
             # Without this, MLflow rejects the app's Host header (403 "Invalid Host
             # header") and tracking silently records nothing.
             - --allowed-hosts={{ include "code-doc-assistant.mlflowAllowedHosts" . }}

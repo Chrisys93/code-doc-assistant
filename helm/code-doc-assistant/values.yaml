@@ -135,6 +135,10 @@ llamacpp:
   contextSize: ""       # --ctx-size.        Empty = tier default
   gpuLayers: ""         # --n-gpu-layers.    Empty = tier default (0 is a valid value: CPU only)
   threads: 4            # CPU threads; set to the physical core count
+  parallel: ""          # --parallel (slots). Empty = server default (auto, 4). The eval asks one question at a
+                        # time, so 1 is cleaner (one KV cache, no contention) -- but changing it restarts the
+                        # server, which reloads the model (slow on this laptop). Set it when you next restart.
+  maxTokens: 1024       # cap on generated tokens per call (app: LLAMACPP_MAX_TOKENS). Keep well below the window.
   # Startup budget = startupFailureThreshold x 10 s before the pod is killed for not being
   # healthy. Loading the 10GB heavy-tier model took ~15 min on minikube/WSL2, so the default
   # is 30 min (180). Raise it if your volume is slower; model load speed is storage-bound.
@@ -206,6 +210,18 @@ ollama:
     enabled: true
     size: 20Gi
     storageClass: ""
+  # GPU for the Ollama pod. Off by default (CPU inference). Same options as llamacpp.gpu:
+  #   mode resource - request nvidia.com/gpu: 1 (needs the NVIDIA device plugin)
+  #   mode runtime  - NVIDIA_VISIBLE_DEVICES=all, no resource request
+  #   wsl2: true    - implies runtime and mounts the node's libdxcore.so (WSL2 / minikube on Docker Desktop)
+  # One GPU, one model server: when Ollama serves the LLM set llamacpp.enabled=false, or the two compete
+  # for VRAM (see values-ollama-gpu.yaml).
+  gpu:
+    enabled: false
+    mode: "resource"
+    runtimeClassName: ""
+    wsl2: false
+    libdxcorePath: "/usr/lib/x86_64-linux-gnu/libdxcore.so"
 
 # --- Application (Streamlit UI + LangGraph agent) ---
 app:
@@ -272,7 +288,13 @@ mlflow:
   # A 512Mi limit makes the current MLflow image OOMKilled, so do not go below ~1Gi.
   resources: {}
   backendStoreUri: "sqlite:////mlflow/mlflow.db"
-  defaultArtifactRoot: "/mlflow/artifacts"
+  # Artifacts (result.json, eval_checks.json, ...) are uploaded THROUGH the server (serveArtifacts), which stores
+  # them under artifactsDestination on its volume. A plain path as defaultArtifactRoot would make every client
+  # write to its own local disk instead, and the UI's Artifacts tab would be empty. Only experiments created
+  # after this setting get the proxied location; an existing experiment keeps the one it was created with.
+  defaultArtifactRoot: "mlflow-artifacts:/"
+  serveArtifacts: true
+  artifactsDestination: "/mlflow/artifacts"
   # Recent MLflow servers answer 403 "Invalid Host header" to any Host not in
   # --allowed-hosts, which silently disables tracking. The chart always allows the
   # in-cluster Service names (short, .<ns>, .<ns>.svc, .<ns>.svc.cluster.local, each

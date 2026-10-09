@@ -48,3 +48,5 @@ minikube-linux-amd64
 models/
 patch_tools.py
 test_pipeline.py
+*:Zone.Identifier
+eval/results/

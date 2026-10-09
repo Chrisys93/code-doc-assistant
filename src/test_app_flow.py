@@ -281,22 +281,32 @@ ag.run_tool = lambda name, args: {"success": True, "count": 0, "chunks": [], "co
 at = fresh(False, "off"); calls_before = FakeLLM.calls; ask(at)
 txt = last(at)
 assert "nothing was retrieved" in txt.lower() and "Sources:" not in txt, txt
-tr = at.session_state["messages"][-1]["trace"]
+tr = at.session_state["trace_log"][-1]["trace"]
 st_by = {t["node"]: t["status"] for t in tr}
 assert st_by["tool_execution"] == "warn" and st_by["context_assembly"] == "warn" and st_by["generation"] == "warn", tr
 assert not any("Answer #" in m["content"] for m in at.session_state["messages"])
-assert any("warning" in e.label for e in at.expander), [e.label for e in at.expander]
+assert any("pipeline warning" in c.value for c in at.caption), "a short warning note must show under the answer"
+assert not [e for e in at.expander if "Pipeline trace" in e.label], "the trace itself must not be in the conversation"
 if REAL_MLFLOW:
     (er,) = runs_for(at.session_state["thread_id"])
     assert er.data.tags["outcome"] == "no_retrieval", er.data.tags
 ag.run_tool = _orig_rt
 
-print("10. Normal answer keeps a persistent per-answer trace and the indexing note after it finishes")
+print("10. The trace is NOT in the conversation: it is kept separately (trace log + its own download); the transcript has none")
 at = fresh(False, "off"); ask(at)
-assert at.session_state["messages"][-1].get("trace"), "answer must carry its trace"
-assert any(m.get("kind") == "index" for m in at.session_state["messages"])
-assert any("Pipeline trace" in e.label for e in at.expander)
-assert "context_assembly" in [t["node"] for t in at.session_state["messages"][-1]["trace"]]
+msgs = at.session_state["messages"]
+assert not any("trace" in m for m in msgs), "no trace inside chat messages"
+assert not [e for e in at.expander if "Pipeline trace" in e.label], "no trace expander in the chat"
+log = at.session_state["trace_log"]
+assert len(log) == 1 and log[0]["question"].startswith("Could A integrate B") and log[0]["run_id"], log
+assert "context_assembly" in [x["node"] for x in log[0]["trace"]]
+assert any(m.get("kind") == "index" for m in msgs), "indexing note persists in the chat"
+dls = [d.proto.label for d in at.get("download_button")]
+assert any("Save trace" in l for l in dls) and any("Save conversation" in l for l in dls), dls
+ask(at, "Second question?")
+assert len(at.session_state["trace_log"]) == 2
+[b for b in at.button if "Clear" in b.label][0].click().run()
+assert at.session_state["trace_log"] == []
 
 print("11. Heavy truncation by the context budget is a visible warning, but the answer is still generated")
 _orig_rt = ag.run_tool
@@ -304,10 +314,33 @@ ag.run_tool = lambda name, args: {"success": True, "count": 10, "collections_sea
     "chunks": [{"content": f"{i}" * 12000, "source_file": f"src/f{i}.py", "start_line": 1, "end_line": 9,
                 "chunk_type": "code", "confidence": 0.7, "repo": "repo_0"} for i in range(10)]}
 at = fresh(False, "off"); ask(at)
-tr = {t["node"]: t for t in at.session_state["messages"][-1]["trace"]}
+tr = {t["node"]: t for t in at.session_state["trace_log"][-1]["trace"]}
 assert tr["context_assembly"]["status"] == "warn" and "dropped for budget" in tr["context_assembly"]["detail"], tr["context_assembly"]
 assert "did not fit" in tr["context_assembly"]["detail"]
 assert tr["generation"]["status"] == "ok" and "Answer #" in last(at), "an answer must still be generated"
 ag.run_tool = _orig_rt
+
+print("12. Saved conversation: indexing notes sit INSIDE the assistant block; one User block and one Assistant block per question")
+import ast as _ast, time as _time, types as _types
+_src = open("app.py").read()
+_fn = next(n for n in _ast.parse(_src).body if isinstance(n, _ast.FunctionDef) and n.name == "_export_conversation_markdown")
+class _SS(dict):
+    __getattr__ = dict.get
+_ss = _SS(thread_id="t-x", repos=["r1"], last_active_model="m (llamacpp)", messages=[
+    {"role": "user", "content": "Q1?"},
+    {"role": "assistant", "kind": "index", "content": "📂 r1 → already_indexed (10 docs)"},
+    {"role": "assistant", "kind": "index", "content": "📂 r2 → already_indexed (20 docs)"},
+    {"role": "assistant", "content": "A1", "warnings": 1},
+    {"role": "user", "content": "Q2?"},
+    {"role": "assistant", "kind": "index", "content": "📂 r1 → error (0 docs)"},
+    {"role": "assistant", "kind": "error", "content": "Indexing failed"}])
+_ns = {"st": _types.SimpleNamespace(session_state=_ss), "time": _time}
+exec(compile(_ast.Module(body=[_fn], type_ignores=[]), "app.py", "exec"), _ns)
+md = _ns["_export_conversation_markdown"]()
+assert md.count("**🧑 User:**") == 2 and md.count("**🤖 Assistant:**") == 2, md
+i = md.index("**🤖 Assistant:**")
+assert md.index("📂 r1 → already_indexed") > i and md.index("📂 r2 → already_indexed") > i, md
+assert md.index("A1") > md.index("📂 r2 → already_indexed"), "notes come before the answer, same block"
+assert "pipeline" not in md.lower().replace("pipeline_", ""), "no trace in the transcript"
 
 print("ALL APP-FLOW CHECKS PASSED")

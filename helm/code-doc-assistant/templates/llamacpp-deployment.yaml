@@ -79,6 +79,10 @@ spec:
             - {{ include "code-doc-assistant.llamacppCtx" . | quote }}
             - "--threads"
             - {{ .Values.llamacpp.threads | quote }}
+            {{- if ne (toString .Values.llamacpp.parallel) "" }}
+            - "--parallel"
+            - {{ .Values.llamacpp.parallel | quote }}
+            {{- end }}
             - "--n-gpu-layers"
             - {{ include "code-doc-assistant.llamacppGpuLayers" . | quote }}
             - "--host"

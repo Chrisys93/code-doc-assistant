@@ -1,0 +1,14 @@
+# Overlay for evaluating the Ollama backend ON THE GPU (WSL2 + minikube), next to the llama.cpp preset:
+#   helm upgrade --install cda ./helm/code-doc-assistant -n code-doc \
+#     -f helm/code-doc-assistant/values-wsl2-minikube.yaml \
+#     -f helm/code-doc-assistant/values-ollama-gpu.yaml \
+#     --set modelTier=heavy        # or full
+# Later -f files win, so this switches the preset's llama.cpp backend off and gives the Ollama pod the GPU.
+# The 12 GB card holds ONE model server at a time, hence llamacpp.enabled=false.
+inferenceBackend: ollama
+llamacpp:
+  enabled: false
+ollama:
+  gpu:
+    enabled: true
+    wsl2: true

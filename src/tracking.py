@@ -262,6 +262,64 @@ def finish_run(run_id: Optional[str], state: Optional[dict] = None, outcome: Opt
         _warn_once("finish", "could not finish the run", e)
 
 
+# ---------------------------------------------------------------------------
+# Group runs and extras -- used by the evaluation runner (eval/run_eval.py)
+# ---------------------------------------------------------------------------
+
+def start_group_run(name: str, params: Optional[dict] = None, tags: Optional[dict] = None) -> Optional[str]:
+    """
+    Open a PARENT run that groups many question runs (one evaluation of one configuration).
+    Child runs join it by passing tags={"mlflow.parentRunId": <this id>} to start_query_run().
+    """
+    try:
+        exp = _setup()
+        all_tags = {"source": "eval", "run.kind": "eval_parent", "start_ms": str(int(time.time() * 1000))}
+        if os.environ.get("EVAL_GROUP"):
+            all_tags["eval.group"] = os.environ["EVAL_GROUP"]
+        all_tags.update({k: _str(v) for k, v in (tags or {}).items() if v is not None})
+        client = _client()
+        run = client.create_run(exp, tags=all_tags, run_name=name)
+        from mlflow.entities import Param
+        client.log_batch(run.info.run_id, params=[Param(k, _str(v)) for k, v in (params or {}).items() if v is not None])
+        return run.info.run_id
+    except Exception as e:  # noqa: BLE001
+        _warn_once("group_start", "could not start the group run", e)
+        return None
+
+
+def log_extra(run_id: Optional[str], metrics: Optional[dict] = None, tags: Optional[dict] = None,
+              params: Optional[dict] = None, artifacts: Optional[dict] = None) -> None:
+    """Add metrics / tags / params / JSON artifacts ({"name.json": obj}) to a run. Failure-tolerant."""
+    if not run_id:
+        return
+    try:
+        from mlflow.entities import Metric, Param, RunTag
+        client = _client()
+        now = int(time.time() * 1000)
+        client.log_batch(
+            run_id,
+            metrics=[Metric(k, float(v), now, 0) for k, v in (metrics or {}).items()
+                     if isinstance(v, (int, float))],
+            params=[Param(k, _str(v)) for k, v in (params or {}).items() if v is not None],
+            tags=[RunTag(k, _str(v)) for k, v in (tags or {}).items() if v is not None])
+        for name, obj in (artifacts or {}).items():
+            client.log_dict(run_id, json.loads(json.dumps(obj, default=str)), name)
+    except Exception as e:  # noqa: BLE001
+        _warn_once("log_extra", "could not add extra data to the run", e)
+
+
+def end_group_run(run_id: Optional[str], error: Optional[str] = None) -> None:
+    if not run_id:
+        return
+    try:
+        client = _client()
+        if error:
+            client.set_tag(run_id, "error", _str(error, 1000))
+        client.set_terminated(run_id, "FAILED" if error else "FINISHED")
+    except Exception as e:  # noqa: BLE001
+        _warn_once("group_end", "could not close the group run", e)
+
+
 def run_url(run_id: Optional[str]) -> Optional[str]:
     """Browser link to a run (uses MLFLOW_UI_URL, not the container-internal tracking URI)."""
     if not run_id:
