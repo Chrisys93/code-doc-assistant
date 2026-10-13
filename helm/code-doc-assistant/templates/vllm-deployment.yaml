@@ -40,12 +40,16 @@ spec:
               port: http
             initialDelaySeconds: 60
             periodSeconds: 15
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
               path: /health
               port: http
             initialDelaySeconds: 90
             periodSeconds: 30
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
           resources:
             requests:
               memory: "12Gi"

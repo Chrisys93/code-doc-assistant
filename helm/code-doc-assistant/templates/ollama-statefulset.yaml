@@ -72,12 +72,16 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
               path: /api/tags
               port: http
             initialDelaySeconds: 30
             periodSeconds: 30
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
       # Init container: pull the LLM and embedding models before the main container starts
       initContainers:
         - name: model-pull

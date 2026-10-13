@@ -127,18 +127,30 @@ spec:
               path: /health
               port: http
             periodSeconds: 10
+            timeoutSeconds: {{ .Values.llamacpp.readiness.timeoutSeconds }}
             failureThreshold: {{ .Values.llamacpp.startupFailureThreshold | default 180 }}
+          # A readiness failure removes the pod from the Service, so clients see "connection
+          # error" although the server is alive. With the default 1 s timeout a briefly slow
+          # /health did that during evaluation.
           readinessProbe:
             httpGet:
               path: /health
               port: http
             periodSeconds: 10
+            timeoutSeconds: {{ .Values.llamacpp.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.llamacpp.readiness.failureThreshold }}
+          {{- if .Values.llamacpp.liveness.enabled }}
+          # A restart reloads the 10GB model (minutes) and loses the request in flight, so a slow
+          # server must not be mistaken for a dead one. Under memory pressure /health can take
+          # seconds; the Kubernetes default timeout of 1 s killed the server mid-evaluation.
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            periodSeconds: 30
-            failureThreshold: 3
+            periodSeconds: {{ .Values.llamacpp.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.llamacpp.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.llamacpp.liveness.failureThreshold }}
+          {{- end }}
           resources:
             {{- with .Values.llamacpp.resources.requests }}
             requests:

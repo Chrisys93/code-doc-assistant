@@ -117,6 +117,18 @@ embedNumGpu: 0
 #   full      mistral-nemo-instruct-2407-q4_k_m.gguf        8192   999  (999 = every layer)
 #   minimal   qwen2.5-coder-3b-instruct-q4_k_m.gguf         2048   999
 #   balanced / lightweight → no default GGUF: set llamacpp.modelFile
+# Probe budgets for every component except llama.cpp (which has its own, see llamacpp.*).
+# Kubernetes defaults to timeoutSeconds: 1, and a service that is merely slow (busy, swapping, loading
+# a model) then gets dropped from its Service (readiness) or killed and restarted (liveness).
+# See the README section "Probes: the recurring Kubernetes trap".
+probes:
+  readiness:
+    timeoutSeconds: 10
+    failureThreshold: 12     # x periodSeconds (10 s) = 2 min before traffic is withdrawn
+  liveness:
+    timeoutSeconds: 10
+    failureThreshold: 10     # x periodSeconds (30 s) = 5 min before a restart
+
 llamacpp:
   # Deploy llama-server even though inferenceBackend is something else (side-by-side
   # comparison, or inferenceBackend=auto).
@@ -143,6 +155,18 @@ llamacpp:
   # healthy. Loading the 10GB heavy-tier model took ~15 min on minikube/WSL2, so the default
   # is 30 min (180). Raise it if your volume is slower; model load speed is storage-bound.
   startupFailureThreshold: 180
+  # Liveness: the pod is restarted after failureThreshold x periodSeconds of /health not answering
+  # within timeoutSeconds (default 10 min). Set enabled: false for evaluation runs, where a slow
+  # server is better than a killed one.
+  # Readiness: how long /health may be slow before the pod is taken out of the Service.
+  readiness:
+    timeoutSeconds: 10
+    failureThreshold: 30   # x 10 s = 5 min
+  liveness:
+    enabled: true
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 20
   extraArgs: []         # appended verbatim, e.g. ["--flash-attn", "on", "--n-cpu-moe", "8"]
   gpu:
     enabled: true       # give the pod the GPU at all (false = CPU only)

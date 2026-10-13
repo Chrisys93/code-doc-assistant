@@ -54,6 +54,8 @@ spec:
                   value: "localhost:{{ .Values.mlflow.service.port }}"
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
               path: /health
@@ -63,6 +65,8 @@ spec:
                   value: "localhost:{{ .Values.mlflow.service.port }}"
             initialDelaySeconds: 15
             periodSeconds: 30
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
           resources:
             {{- if .Values.mlflow.resources }}
             {{- toYaml .Values.mlflow.resources | nindent 12 }}

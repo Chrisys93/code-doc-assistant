@@ -98,11 +98,15 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
               path: /_stcore/health
               port: http
             initialDelaySeconds: 15
             periodSeconds: 30
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
           resources:
             {{- include "code-doc-assistant.appResources" . | nindent 12 }}
