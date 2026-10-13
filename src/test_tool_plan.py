@@ -123,6 +123,17 @@ check("two different queries returning the same passages count them once",
       len(out2["executed_tool_calls"]) == 2 and len(out2["retrieved_chunks"]) == 2 and "2 duplicate chunk(s) removed" in out2["execution_trace"][-1]["detail"],
       f"{len(out2['retrieved_chunks'])} chunks; {out2['execution_trace'][-1]['detail']}")
 
+# top_k belongs to the code, not the planner (heavy-007 Q4 got 10 chunks, heavy-008 Q4 got 5, same question)
+a = {"query": "q", "top_k": 5, "collections": [A]}
+ign = ag._scope_vector_search_args(a, [A], fix_top_k=True)
+check("planner's top_k is dropped and reported when the plan is proposed", "top_k" not in a and any(i.startswith("top_k=5") for i in ign), f"{a} {ign}")
+a = {"query": "q", "top_k": 13, "collections": [A]}
+ag._scope_vector_search_args(a, [A])
+check("... but kept at execution (the supervisor's retry widening)", a.get("top_k") == 13, str(a))
+a = {"query": "q", "top_k": 7, "collections": [A]}
+ag._scope_vector_search_args(a, [A], human_edited=True, fix_top_k=True)
+check("... and kept when a person edited the plan", a.get("top_k") == 7, str(a))
+
 # the sampler records paging pressure
 import host_sampler
 p = host_sampler.sample_pressure()

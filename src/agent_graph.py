@@ -584,6 +584,12 @@ Example:
 # scope (a weak planner mangles collection arguments, see _scope_vector_search_args). QUERY_REPO_SCOPE=off restores
 # "search everything" for comparison.
 QUERY_REPO_SCOPE = os.environ.get("QUERY_REPO_SCOPE", "on").strip().lower() not in ("off", "0", "false", "no")
+# How many chunks a search returns is a retrieval setting, so the code owns it (config.TOP_K), not the planner.
+# Left to the planner it varied between runs of the SAME question (heavy-007 Q4: top_k 10 -> 10 chunks, heavy-008 Q4:
+# top_k 5 -> 5 chunks), which makes models in one tier get different evidence. Applies to the planner's proposal only;
+# a person editing the plan, and the supervisor's own retry widening (top_k + 3), still win.
+# FIXED_TOP_K=off restores "the planner chooses" for comparison.
+FIXED_TOP_K = os.environ.get("FIXED_TOP_K", "on").strip().lower() not in ("off", "0", "false", "no")
 # Tools that take `repo_path` (grep, cat, find, git_*, ast_parse) need a local directory. Here `repo_path` is the git URL
 # (repos are cloned to a temp dir only to be indexed), so those calls can only fail; they cost planner tokens and time.
 # DROP_UNRUNNABLE_TOOLS=off keeps them (only useful when repo_path is a real checkout).
@@ -670,7 +676,8 @@ def _dedupe_tool_calls(tool_calls: list) -> tuple[list, int]:
     return kept, len(tool_calls) - len(kept)
 
 
-def _scope_vector_search_args(args: dict, active_cols: list, human_edited: bool = False) -> list[str]:
+def _scope_vector_search_args(args: dict, active_cols: list, human_edited: bool = False,
+                              fix_top_k: bool = False) -> list[str]:
     """
     Normalise a vector_search call in place and return what was ignored, as readable strings.
 
@@ -712,6 +719,9 @@ def _scope_vector_search_args(args: dict, active_cols: list, human_edited: bool 
         for k in ("score_threshold", "filter_file"):
             if k in args:
                 dropped.append(f"{k}={args.pop(k)!r}")
+        # Only when the plan is first proposed (fix_top_k): at execution the supervisor may have widened top_k on purpose.
+        if fix_top_k and "top_k" in args:
+            dropped.append(f"top_k={args.pop('top_k')!r}")
     return dropped
 
 
@@ -776,7 +786,7 @@ def node_tool_selection(state: AgentState) -> dict[str, Any]:
     scope_cols, named_cols = _scope_for_query(state["query"], active_cols)
     for tc in tool_calls:
         if tc.tool_name == "vector_search":
-            ignored.extend(_scope_vector_search_args(tc.args, scope_cols))
+            ignored.extend(_scope_vector_search_args(tc.args, scope_cols, fix_top_k=FIXED_TOP_K))
     tool_calls, n_repeated = _dedupe_tool_calls(tool_calls)
     if n_repeated:
         ignored.append(f"{n_repeated} repeated tool call(s) removed")
