@@ -70,8 +70,15 @@ eval/run_with_sampler.sh llamacpp-heavy heavy-002 -- --stage A --only Q1,Q2     
 
 It starts the host sampler (and records an idle baseline), launches `run_eval.py` in the pod under `nohup` (a dropped
 `kubectl exec` or closed terminal cannot kill it), polls until it finishes, records an idle tail, **stops the sampler
-itself**, copies the results out and runs `join_resources.py --mlflow`. To walk away, run it under `tmux` or
-`nohup eval/run_with_sampler.sh ... > run.out 2>&1 &`. Settings (environment): `NS`, `SETTLE`, `COOLDOWN`, `POLL`,
+itself**, copies the results out and runs `join_resources.py --mlflow`.
+
+**Launch and leave:** the script detaches itself (own session, no terminal or `tmux` needed) and returns at once; it
+exits by itself when the whole run is done. Follow it with `tail -f eval/results/<group>/script.log`; when
+`script.exit` appears in that folder the run is over (it holds the exit code); stop it with
+`kill $(cat eval/results/<group>/script.pid)` (the run in the pod keeps going). `FOREGROUND=1` keeps it attached
+to the terminal. The host must stay awake (WSL2 stops when Windows sleeps).
+
+Settings (environment): `NS`, `SETTLE`, `COOLDOWN`, `POLL`,
 `EXPERIMENT` (default `code-doc-assistant-eval`: eval runs are kept apart from the UI's runs), `PYTHON`, `MLFLOW_TRACKING_URI` (default: a port-forward to the in-cluster MLflow), `JOIN_MLFLOW=0` to skip the upload.
 
 **MLflow artifacts need the proxied artifact root** (`mlflow.serveArtifacts`, the chart default since this change). With
