@@ -251,7 +251,7 @@ def main(argv=None) -> int:
         # What the model was actually shown, and which retrieved chunks made it in: without this a weak answer cannot be
         # told apart (chunk dropped for the budget / chunk present but ignored / retrieval missed it).
         ctx_text = state.get("final_context") or ""
-        chunk_info = [{"rank": i + 1, "file": getattr(c, "source_file", ""),
+        chunk_info = [{"rank": i + 1, "repo": getattr(c, "repo", ""), "file": getattr(c, "source_file", ""),
                        "lines": f"{getattr(c, 'start_line', '')}-{getattr(c, 'end_line', '')}",
                        "chars": len(getattr(c, "content", "") or ""),
                        "confidence": getattr(c, "confidence", None),

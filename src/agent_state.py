@@ -36,6 +36,7 @@ class Chunk:
     end_line: Optional[int] = None
     chunk_type: str = "text"          # "function", "class", "text", "grep_match"
     confidence: float = 0.0           # similarity score (0–1); 1.0 for exact matches
+    repo: str = ""                    # per-repo collection the chunk came from ("" for non-vector tools)
 
 
 # ---------------------------------------------------------------------------

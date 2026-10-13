@@ -55,6 +55,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Literal, Optional
 
@@ -577,6 +578,98 @@ Example:
 """
 
 
+# Repo scope: a question that names a repository is answered from THAT repository's collection. Without this every
+# vector search spanned all active collections and the fair merge handed each repo an equal share of the slots, so a
+# question about chapter3 spent most of its context on the other two repos. The code, not the planner, decides the
+# scope (a weak planner mangles collection arguments, see _scope_vector_search_args). QUERY_REPO_SCOPE=off restores
+# "search everything" for comparison.
+QUERY_REPO_SCOPE = os.environ.get("QUERY_REPO_SCOPE", "on").strip().lower() not in ("off", "0", "false", "no")
+# Tools that take `repo_path` (grep, cat, find, git_*, ast_parse) need a local directory. Here `repo_path` is the git URL
+# (repos are cloned to a temp dir only to be indexed), so those calls can only fail; they cost planner tokens and time.
+# DROP_UNRUNNABLE_TOOLS=off keeps them (only useful when repo_path is a real checkout).
+DROP_UNRUNNABLE_TOOLS = os.environ.get("DROP_UNRUNNABLE_TOOLS", "on").strip().lower() not in ("off", "0", "false", "no")
+
+
+def _alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _repo_names_for_collection(col: str) -> list[str]:
+    """Names a user may use for a collection: repo_<slug>_<8 hex> -> the slug, and the slug without a trailing
+    branch token (code_doc_assistant_dev -> also code_doc_assistant). Normalised to lower-case alphanumerics, and
+    only names of 6+ characters count, so short branch names cannot match by accident."""
+    m = re.match(r"^repo_(.+)_[0-9a-f]{8}$", col or "")
+    slug = m.group(1) if m else (col or "")
+    parts = [x for x in slug.split("_") if x]
+    names = {_alnum(slug)}
+    if len(parts) > 1:
+        names.add(_alnum("_".join(parts[:-1])))
+    return [n for n in names if len(n) >= 6]
+
+
+def _repo_label(col: str) -> str:
+    """Readable repo name from a collection name: repo_icarusreposend_f5929c11 -> icarusreposend."""
+    m = re.match(r"^repo_(.+)_[0-9a-f]{8}$", col or "")
+    return m.group(1) if m else (col or "")
+
+
+def _scope_for_query(query: str, active_cols: list) -> tuple[list, list]:
+    """(collections to search, collections the question names). Names none -> all active, names some -> only those."""
+    cols = list(active_cols or [])
+    if not QUERY_REPO_SCOPE or len(cols) < 2:
+        return cols, []
+    q = _alnum(query)
+    named = [c for c in cols if any(n in q for n in _repo_names_for_collection(c))]
+    return (named or cols), named
+
+
+def _drop_unrunnable_tools(tool_calls: list, query: str) -> tuple[list, list[str]]:
+    """(calls to run, names dropped). Drops planned tools that need a local checkout when there is none.
+
+    grep / cat / find / git_log / git_blame / stat / ast_parse take `repo_path`, a directory. In this deployment
+    it is the repository's git URL, so every such call fails (most calls on Q8-Q10 in heavy-003). vector_search
+    needs no checkout and is kept; if nothing is left, a plain vector_search on the question replaces the plan."""
+    if not DROP_UNRUNNABLE_TOOLS:
+        return tool_calls, []
+    try:
+        registry = build_tool_registry()
+    except Exception:
+        return tool_calls, []
+    kept, dropped = [], []
+    for tc in tool_calls:
+        needs_dir = "repo_path" in (registry.get(tc.tool_name, {}).get("required_args") or [])
+        rp = str(tc.args.get("repo_path") or "")
+        if needs_dir and not (rp and os.path.isdir(rp)):
+            dropped.append(tc.tool_name)
+        else:
+            kept.append(tc)
+    if not kept:
+        kept = [ToolCall(tool_name="vector_search", args={"query": query, "chroma_host": CHROMA_HOST})]
+    return kept, dropped
+
+
+def _call_key(tc) -> str:
+    """Identity of a tool call: the tool and its arguments, order-insensitive."""
+    return tc.tool_name + "|" + json.dumps(tc.args, sort_keys=True, default=str)
+
+
+def _dedupe_tool_calls(tool_calls: list) -> tuple[list, int]:
+    """(calls without repeats, number removed). Call AFTER the arguments are normalised.
+
+    A weak planner sometimes proposes the same call twice (heavy-007 Q4: two identical vector_search calls).
+    Once the code has set the scope the two are byte-identical, so the second one only repeats the first one's
+    results and doubles the reported chunk count. The first occurrence is kept, in order."""
+    seen: set[str] = set()
+    kept = []
+    for tc in tool_calls:
+        k = _call_key(tc)
+        if k in seen:
+            continue
+        seen.add(k)
+        kept.append(tc)
+    return kept, len(tool_calls) - len(kept)
+
+
 def _scope_vector_search_args(args: dict, active_cols: list, human_edited: bool = False) -> list[str]:
     """
     Normalise a vector_search call in place and return what was ignored, as readable strings.
@@ -608,7 +701,7 @@ def _scope_vector_search_args(args: dict, active_cols: list, human_edited: bool 
             planned.append(args["collection_name"])
         if not human_edited:
             if planned and set(planned) != set(active_cols):
-                dropped.append(f"collections={planned!r} (searching all {len(active_cols)} active)")
+                dropped.append(f"collections={planned!r} (searching the {len(active_cols)} in scope)")
             args["collections"] = list(active_cols)
             args.pop("collection_name", None)
         elif not planned:
@@ -679,9 +772,14 @@ def node_tool_selection(state: AgentState) -> dict[str, Any]:
     # Normalise before anyone sees the plan (see _scope_vector_search_args): the human review
     # step then shows what will really run, and what the planner got wrong stays in the trace.
     ignored: list[str] = []
+    tool_calls, dropped_tools = _drop_unrunnable_tools(tool_calls, state["query"])
+    scope_cols, named_cols = _scope_for_query(state["query"], active_cols)
     for tc in tool_calls:
         if tc.tool_name == "vector_search":
-            ignored.extend(_scope_vector_search_args(tc.args, active_cols))
+            ignored.extend(_scope_vector_search_args(tc.args, scope_cols))
+    tool_calls, n_repeated = _dedupe_tool_calls(tool_calls)
+    if n_repeated:
+        ignored.append(f"{n_repeated} repeated tool call(s) removed")
 
     # Planner-quality signals for the model comparison: did it return a usable plan at all, and how
     # many of its arguments did the code have to override?
@@ -696,7 +794,11 @@ def node_tool_selection(state: AgentState) -> dict[str, Any]:
                   "detail": f"proposed {len(tool_calls)} tool(s): " + "; ".join(
                       f"{tc.tool_name}({json.dumps(tc.args, default=str)[:160]})"
                       for tc in tool_calls)
-                  + (f" | ignored planner args: {', '.join(ignored)}" if ignored else "")})
+                  + (f" | repo scope: {', '.join(named_cols)} (named in the question)" if named_cols
+                     else (f" | repo scope: all {len(active_cols)} (no repository named in the question)"
+                           if len(active_cols) > 1 else ""))
+                  + (f" | ignored planner args: {', '.join(ignored)}" if ignored else "")
+                  + (f" | dropped (need a local checkout, repo_path is a URL): {', '.join(dropped_tools)}" if dropped_tools else "")})
     out: dict[str, Any] = {"proposed_tool_calls": tool_calls, "execution_trace": trace}
     if replan_feedback is not None:
         out["planner_feedback"] = None            # consumed
@@ -798,10 +900,13 @@ def node_tool_execution(state: AgentState) -> dict[str, Any]:
     executed: list[ToolCall] = []
     new_chunks: list[Chunk] = []
     vec_calls = vec_hits = 0       # vector_search calls / chunks they returned (0 hits is a warning, not a success)
-    active_cols = state.get("active_collections", [])
+    active_cols, _named = _scope_for_query(state.get("query", ""), state.get("active_collections", []))
     dropped_args: list[str] = []
     human_edited = getattr(state.get("hitl_checkpoint"), "decision", None) == "modified"
+    store_errors: list[str] = []   # vector store could not be asked (not the same as 'no match')
+    skipped_repeats = 0
 
+    seen_calls: set[str] = set()
     for tc in approved:
         # Normally a no-op: node_tool_selection already normalised the plan, so the human
         # reviewed exactly what runs. It still guards plans that did not come from the
@@ -810,7 +915,14 @@ def node_tool_execution(state: AgentState) -> dict[str, Any]:
         if tc.tool_name == "vector_search":
             dropped_args.extend(_scope_vector_search_args(
                 tc.args, active_cols, human_edited=human_edited))
+        key = _call_key(tc)
+        if key in seen_calls:      # same tool, same arguments: its results would be copies
+            skipped_repeats += 1
+            continue
+        seen_calls.add(key)
         result = run_tool(tc.tool_name, tc.args)
+        if tc.tool_name == "vector_search":
+            store_errors.extend(result.get("collections_failed") or [])
         tc.result = result.get("result", "") or json.dumps(result.get("chunks", []))
         tc.success = result.get("success", False)
         tc.error = result.get("error")
@@ -831,6 +943,7 @@ def node_tool_execution(state: AgentState) -> dict[str, Any]:
                     end_line=c.get("end_line"),
                     chunk_type=c.get("chunk_type", "text"),
                     confidence=c.get("confidence", 0.0),
+                    repo=c.get("repo", "") or "",
                 ))
         elif tc.tool_name != "vector_search" and tc.success and tc.result:
             # Shell/AST tools: wrap output as a single chunk, high confidence (exact match).
@@ -847,15 +960,30 @@ def node_tool_execution(state: AgentState) -> dict[str, Any]:
                 confidence=1.0,
             ))
 
+    # The same chunk can come back from two different calls (e.g. two queries that rank the same passages).
+    # Keep the first copy, so "chunks retrieved" counts distinct evidence, not repeats.
+    _seen_chunks: set[tuple] = set()
+    _unique_chunks: list[Chunk] = []
+    for c in new_chunks:
+        k = (c.repo, c.source_file, c.content.strip())
+        if k not in _seen_chunks:
+            _seen_chunks.add(k)
+            _unique_chunks.append(c)
+    n_dup_chunks = len(new_chunks) - len(_unique_chunks)
+    new_chunks = _unique_chunks
+
     scores = [c.confidence for c in new_chunks]
     trace = list(state.get("execution_trace", []))
-    trace.append({"node": "tool_execution", "status": "warn" if (vec_calls and not vec_hits) else "ok",
+    trace.append({"node": "tool_execution", "status": "warn" if ((vec_calls and not vec_hits) or store_errors) else "ok",
                   "detail": f"ran {len(executed)} tool(s), got {len(new_chunks)} chunk(s) -- " + "; ".join(
                       f"{t.tool_name}:{'ok' if t.success else 'FAIL'}"
                       + (f" collections={t.args.get('collections')}" if t.tool_name == "vector_search" else "")
                       + (f" error={str(t.error)[:100]}" if t.error else "")
                       for t in executed)
                   + (f" | ignored planner args: {', '.join(dropped_args)}" if dropped_args else "")
+                  + (f" | {skipped_repeats} repeated tool call(s) skipped" if skipped_repeats else "")
+                  + (f" | {n_dup_chunks} duplicate chunk(s) removed" if n_dup_chunks else "")
+                  + (f" | VECTOR STORE ERRORS (the store could not be asked; this is not 'no match'): {'; '.join(store_errors)}" if store_errors else "")
                   + (" | WARNING: vector_search returned 0 chunks (empty or unindexed collections?)"
                      if vec_calls and not vec_hits else "")})
     return {
@@ -1046,7 +1174,7 @@ def node_context_assembly(state: AgentState) -> dict[str, Any]:
     truncated = 0
 
     for c in unique:
-        part = f"### {c.source_file}" + (
+        part = f"### " + (f"[{_repo_label(c.repo)}] " if getattr(c, "repo", "") else "") + f"{c.source_file}" + (
             f" (lines {c.start_line}–{c.end_line})" if c.start_line else ""
         ) + f"\n```\n{c.content}\n```\n"
         if total_chars + len(part) > max_chars:

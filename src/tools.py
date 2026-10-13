@@ -220,6 +220,17 @@ def tool_stat(repo_path: str, file_path: str) -> dict[str, Any]:
     return {"result": output, "success": success}
 
 
+def _is_missing_collection(e: Exception) -> bool:
+    """True when Chroma says the collection does not exist (the repo is simply not indexed).
+
+    Chroma raises ValueError / InvalidCollectionException ("Collection x does not exist.") for an unknown
+    collection. Anything else (connection refused, timeout, a 5xx) means the store could not be asked, which is
+    NOT the same as "nothing matched" and must not be reported as such."""
+    msg = str(e).lower()
+    name = type(e).__name__.lower()
+    return "does not exist" in msg or "not found" in msg or "invalidcollection" in name or "notfound" in name
+
+
 def tool_vector_search(query: str, chroma_host: str = "", collection_name: str = "codebase",
                        collections: Any = None, top_k: int = None, score_threshold: float = 0.3,
                        filter_file: str = "") -> dict[str, Any]:
@@ -282,11 +293,17 @@ def tool_vector_search(query: str, chroma_host: str = "", collection_name: str =
 
         chunks = []
         searched = []
+        missing: list[str] = []     # collection does not exist (repo not indexed)
+        failed: list[str] = []      # the store could not be asked (unreachable, timeout, server error)
         for cname in targets:
             try:
                 collection = client.get_collection(cname)
-            except Exception:
-                continue  # collection missing (repo not indexed) — skip, search the rest
+            except Exception as e:  # noqa: BLE001
+                if _is_missing_collection(e):
+                    missing.append(cname)   # repo not indexed — skip, search the rest
+                else:
+                    failed.append(f"{cname}: {type(e).__name__}: {str(e)[:120]}")
+                continue
             searched.append(cname)
             # Over-fetch (2x) so that removing duplicates still leaves top_k distinct chunks,
             # but never ask for more than the collection holds (Chroma warns when asked to).
@@ -320,6 +337,14 @@ def tool_vector_search(query: str, chroma_host: str = "", collection_name: str =
                     "confidence": round(score, 4),
                 })
 
+        # An unreachable store used to look exactly like "no match" (success, 0 chunks). In heavy-004 Chroma was
+        # unreachable for ~40 minutes and Q10 was recorded as a retrieval result. Fail loudly when NOTHING could be
+        # searched because of errors; with some collections searched, report the failed ones alongside the hits.
+        if failed and not searched:
+            return {"chunks": [], "success": False, "count": 0,
+                    "error": "vector store error, nothing could be searched: " + "; ".join(failed),
+                    "collections_searched": [], "collections_missing": missing, "collections_failed": failed}
+
         # Fair merge across collections: interleave by within-collection rank so a larger
         # repo can't crowd out a smaller one. (Single collection → plain score order.)
         by_repo: dict[str, list] = {}
@@ -336,7 +361,7 @@ def tool_vector_search(query: str, chroma_host: str = "", collection_name: str =
             rank += 1
 
         return {"chunks": merged, "success": True, "count": len(merged),
-                "collections_searched": searched}
+                "collections_searched": searched, "collections_missing": missing, "collections_failed": failed}
     except Exception as e:
         return {"chunks": [], "success": False, "error": str(e)}
 
