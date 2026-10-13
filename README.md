@@ -94,7 +94,7 @@ flowchart TD
 
 **MLflow** is a system-level observability layer — it logs every agent run regardless of which inference backend is active, which tools were called, how many retrieval attempts the supervisor made, what HITL decisions were recorded, and what quality gate scores were produced. It is not associated with any particular inference server.
 
-**Multi-repo retrieval.** `TE <-->|vector search| CHROMA` above is per-repo, not global: each repo (GitHub URL or local path) is embedded into its own ChromaDB collection — one embedding model, many collections, so repos share a vector space but stay isolated at retrieval time. A deterministic gate (`repo_index.py`) ensures every repo entered is indexed before a query runs (idempotent — already-indexed repos are skipped in ~milliseconds). When a query spans multiple repos, `vector_search` merges results across their collections with **fair per-repo representation**: chunks are interleaved by within-collection rank rather than pooled by raw score, so a larger or more semantically "central" repo can't crowd a smaller one out of the context window. See [Multi-Repo Retrieval](#multi-repo-retrieval) below.
+**Multi-repo retrieval.** `TE <-->|vector search| CHROMA` above is per-repo, not global: each repo (GitHub URL or local path) is embedded into its own ChromaDB collection — one embedding model, many collections, so repos share a vector space but stay isolated at retrieval time. A deterministic gate (`repo_index.py`) ensures every repo entered is indexed before a query runs (idempotent — already-indexed repos are skipped in ~milliseconds). The search is scoped to the repos the question names (all active repos when it names none); when it spans several repos, `vector_search` merges results across their collections with **fair per-repo representation**: chunks are interleaved by within-collection rank rather than pooled by raw score, so a larger or more semantically "central" repo can't crowd a smaller one out of the context window. See [Multi-Repo Retrieval](#multi-repo-retrieval) below.
 
 ---
 
@@ -163,7 +163,7 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 #### Multiple repositories
 
-Enter one or more repos (GitHub URLs or local paths), one per line, in the **Repos** field. Each is deterministically indexed into its own ChromaDB collection before the query runs — you'll see a `📂 <repo> → indexed (N docs)` line per repo. Cross-repo questions retrieve from all active collections with fair per-repo representation (see [Multi-Repo Retrieval](#multi-repo-retrieval)).
+Enter one or more repos (GitHub URLs or local paths), one per line, in the **Repos** field. Each is deterministically indexed into its own ChromaDB collection before the query runs — you'll see a `📂 <repo> → indexed (N docs)` line per repo. A question that names a repo searches only that repo; a cross-repo question, or one naming none, retrieves from all active collections with fair per-repo representation (see [Multi-Repo Retrieval](#multi-repo-retrieval)).
 
 `TOP_K` (default `10`) is the total chunks returned **across all active collections combined** — fair-merge splits this across repos, so raise it if a multi-repo query needs more per-repo coverage:
 
@@ -433,6 +433,60 @@ helm install cda ./helm/code-doc-assistant \
   --set ingress.enabled=true --set ingress.hosts[0].host=docs.internal.example.com
 ```
 
+### Probes: the recurring Kubernetes trap
+
+Kubernetes probes default to `timeoutSeconds: 1`. A server that is busy, swapping or still paging in a model can take longer than that to answer `/health` and nothing is wrong with it, but:
+
+- a **readiness** failure removes the pod from the Service, so clients get "connection error" or "connection refused" while the process is alive and healthy;
+- a **liveness** failure makes the kubelet SIGTERM and then SIGKILL the pod (exit code 137, no `OOMKilled` reason), which reloads the 10 GB model and loses the request in flight.
+
+This showed up in the first full evaluation (`heavy-002`): 5 of 13 questions failed with `OpenAIConnectionError`, with the server idle or restarting and the log ending in `cleaning up before exit...`. Rules for every component in this chart:
+
+- Never leave `timeoutSeconds` at its default for a slow-responding service (inference servers, databases, anything that loads large state). Probe budgets are values, not constants: `probes.readiness` / `probes.liveness` for app, ChromaDB, MLflow, Ollama and vLLM, and `llamacpp.readiness`, `llamacpp.liveness`, `llamacpp.startupFailureThreshold` for llama.cpp.
+- Readiness should tolerate slowness for minutes; liveness should be slower still, and can be switched off for evaluation runs (`--set llamacpp.liveness.enabled=false`), where a slow server is better than a killed one.
+- A connection error during an evaluation is first an infrastructure question: check `kubectl describe pod` (Last State, Restart Count, probe settings) and `kubectl get events` **within the hour** (events expire) before looking at the application.
+
+### Retrieval scope and evaluation: the recurring retrieval trap
+
+> **Important.** In a multi-repository RAG pipeline, retrieval decides what the model can answer. Evaluate chunking and retrieval **separately from generation, and before it**, and make retrieval **follow the repository the question is about**. A model comparison run on a retriever that ignores which repository was asked about measures the retriever, not the models.
+
+**What went wrong first (`heavy-002`, `heavy-003`).** Every question searched all active collections with an equal share of `TOP_K` per repository, and the planner's own `collections` argument was overwritten with "all active collections" (it sees hashed names like `repo_icarusreposend_f5929c11` and mangles them). So a question about one repository spent the rest of its slots on the others: for Q4 (IcarusRepoSEND) the files its check expects were outside the top 60; for Q8 the second required file only appeared at rank 31; Q1 retrieved a header-only chunk (imports and licence lines); Q10 named no repository and the answer did not say which one it used.
+
+**The rule now.** The repositories named in the question set where the search runs. "Equal interest in all repositories" applies only when the question names none, and the trace says which case it was.
+
+| Piece | Where |
+|---|---|
+| Scope derived in code from repository names in the question (names none: all; names some: only those) | `_scope_for_query`, `QUERY_REPO_SCOPE=off` restores the old behaviour for an ablation |
+| Each chunk carries its repository; context blocks are headed `[repo] file lines` so identical file names (`README.md`, `config.py`) are distinguishable | `Chunk.repo`, context assembly |
+| Trace line `repo scope: <names> (named in the question)` or `all N (no repository named in the question)` | `node_tool_selection` |
+| Chroma errors are reported, not swallowed as "no such collection"; zero searchable collections is a failure | `tool_vector_search` (`collections_missing`, `collections_failed`) |
+| Tools that need a local `repo_path` (`grep`, `cat`, `find`, `git_*`, `stat`, `ast_parse`) are dropped from the plan, because `repo_path` is a git URL and the clone is a throwaway temp dir | `_drop_unrunnable_tools`, `DROP_UNRUNNABLE_TOOLS=off` |
+
+Limits: names match after lower-casing and stripping punctuation, at six or more characters, and a branch name alone never matches. "The other repository" or "the thesis code" is not detected and is searched across all repositories. This is name matching, not understanding.
+
+**Current chunking and retrieval configuration.** Code: AST `CodeSplitter` (`chunk_lines` 40, overlap 5, `max_chars` = `CHUNK_SIZE`) when `CHUNKING_STRATEGY=ast` (default, except lightweight and minimal tiers). Text, config and parser failures: `SentenceSplitter`, `CHUNK_SIZE` 1500 characters, `CHUNK_OVERLAP` 200. Embedding `nomic-embed-text` (768 d) on CPU. `TOP_K` 10, threshold 0.3, duplicates removed, fair merge across the in-scope collections, context cut to the model's budget (4096 tokens on the heavy tier), so rank decides what the model sees. Known weaknesses: header-only chunks, empty `start_line` / `end_line` (no line provenance), one fixed granularity for function-level and file-level questions.
+
+**Rules for evaluating it.**
+
+1. **Retrieval first.** Use the retrieval measures (hit rate, recall@k, MRR): are the files a question needs among the retrieved ones, and at what rank? Answer quality (`must_mention`, `cite_*`, judge) comes after. Read a failed check in order: could the store be asked, was the evidence retrieved, did it reach the context, did the model use it?
+2. **Record what the model saw** (`context`, `chunks` with their repository). Without it a missing term cannot be attributed.
+3. **"The store could not be asked" is not "nothing matched".** `heavy-004` Q10 returned zero chunks because Chroma was unreachable and the tool reported success. The trace now says `VECTOR STORE ERRORS`.
+4. **Changing a retrieval setting starts a new baseline** (scope mode, `TOP_K`, threshold, chunking, embedding model, tools offered to the planner). `heavy-004` and later are not comparable with `heavy-002` / `heavy-003` on retrieval or tool counts.
+5. **Compare models only within a tier and with identical retrieval.** To compare retrievers, hold the model fixed or evaluate retrieval alone.
+6. **Questions must be answerable by the retriever.** Similarity search cannot enumerate a repository or answer abstractly; Q4 and Q8 fail on question design, not on the model. Label question kinds (for example `ambiguity_cross_repo`) and score an ambiguous question by whether the answer names the repositories it drew on.
+7. **Latency and resource figures need the same workload and a clean host.** `heavy-004` made the same calls and retrieved the same chunks as `heavy-003` (Q4: 1 call, 5 chunks) and took 21 times as long, because the host was out of memory and the node stalled. Start from `eval/pre_run_reset.sh`.
+
+**Run log for this topic.**
+
+| Run | State |
+|---|---|
+| `heavy-002` | Complete, but 5 of 13 questions hit connection errors (1 s readiness probe timeouts, see the previous section). Scope: all repositories. |
+| `heavy-003` | Clean, 8 of 8 answered (the five that failed in `heavy-002` plus three probe reruns). Scope: all repositories. Baseline for the old behaviour. |
+| `heavy-004` | **Invalid.** First run with query scope and repository labels; host out of memory, node stalled, pods recreated. Tagged `eval.invalid` in MLflow. |
+| `heavy-005` | **Did not run.** Exited with code 1 after 1.5 minutes: the runner's MLflow preflight timed out (5 s read timeout) about 9 minutes after the reset. No question was executed and nothing was recorded. |
+
+Open items: chunk size and overlap sweep scored with retrieval-only metrics; function against file granularity (the adaptive approach in `ARCHITECTURE.md`); lexical plus vector retrieval for exact identifiers; repository filter in Chroma metadata; persistent local checkouts so the path tools can run; line-level provenance; the `break` against `continue` context policy; the planner's tool-selection step (up to 101 s on one question).
+
 ---
 
 ## Model Tiers
@@ -572,6 +626,7 @@ Enter one or more repos (GitHub URL or local path) in the Streamlit **Repos** fi
 **Design.**
 - **One embedding model, many collections.** Every repo is embedded with the same model — the same shared vector space — but stored in its own ChromaDB collection (`repo_<slug>_<hash>`, deterministic per repo ref, collision-resistant via a short hash of the full URL/path). Isolation is at the retrieval layer, not the embedding layer.
 - **Fair-merge retrieval.** `vector_search` accepts a `collections` list and merges results by interleaving within-collection rank — repo A's best chunk, repo B's best chunk, repo A's 2nd-best, and so on — rather than pooling all chunks and sorting by raw score. Pooled-by-score merging silently favours whichever repo's content happens to score higher on a given query (larger corpus, more central-vocabulary domain), which can starve a smaller or more tangential repo out of the context window entirely even when it's the one the question is actually about. Fair-merge guarantees every active repo gets representation proportional to `top_k`, not to its raw score.
+- **Scope is derived from the question, not from the planner.** Repo names found in the question (six or more characters, case and punctuation ignored) restrict the search to those collections; with none named, all active collections are searched and fair-merge applies. Context blocks are headed `[repo] file lines`. Details and limits: [Retrieval scope and evaluation](#retrieval-scope-and-evaluation-the-recurring-retrieval-trap).
 - **`TOP_K` is a total, not a per-repo count** (default `10`, `config.py`/env-driven). Fair-merge splits it across active collections — a 2-repo query gets up to 5 slots each; raise `TOP_K` for multi-repo queries that need more per-repo coverage, at the usual recall/precision-and-context-budget trade-off.
 - **Tool-selection is told the index exists.** The tool-selection prompt receives the active collection list explicitly (`Indexed repos (already embedded, use vector_search): ...`) and is instructed to prefer `vector_search` over single-file tools like `github_fetch` for already-indexed repos — without this, a capable model will still reasonably reach for fetching a README to "learn about" a repo it doesn't know is already searchable.
 

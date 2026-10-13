@@ -12,14 +12,17 @@
 #   4. stops the sampler (always, also on error or Ctrl+C), copies the results out of the pod
 #   5. runs join_resources.py --mlflow: res_* metrics on every question run, peaks/means + the raw samples
 #      on the parent run
-# To walk away: run it under tmux or `nohup eval/run_with_sampler.sh ... > run.out 2>&1 &`.
+# Launch and leave: by default the script detaches ITSELF (own session, no terminal needed) and returns at once. Its
+# output goes to eval/results/<group>/script.log, the exit code to script.exit when it ends, its pid to script.pid.
+# Follow it with `tail -f eval/results/<group>/script.log`; stop it with `kill $(cat eval/results/<group>/script.pid)`.
+# FOREGROUND=1 keeps it attached to the terminal instead (the old behaviour).
 #
 # Environment: NS (code-doc)  SETTLE (30 s idle before)  COOLDOWN (20 s idle after)  POLL (30 s)
 #              EXPERIMENT (code-doc-assistant-eval)  PYTHON (python)  MLFLOW_TRACKING_URI (default: a port-forward to the in-cluster MLflow)
-#              JOIN_MLFLOW (1)  POD (default: first app pod)
+#              JOIN_MLFLOW (1)  POD (default: first app pod)  FOREGROUND (0)
 set -uo pipefail
 
-if [[ $# -lt 1 || "$1" == -h || "$1" == --help ]]; then sed -n 2,22p "$0" | sed 's/^# \{0,1\}//'; exit 2; fi
+if [[ $# -lt 1 || "$1" == -h || "$1" == --help ]]; then sed -n 2,26p "$0" | sed 's/^# \{0,1\}//'; exit 2; fi
 CONFIG="$1"; shift
 GROUP="${CONFIG}-$(date +%Y%m%d-%H%M)"
 if [[ $# -gt 0 && "$1" != "--" ]]; then GROUP="$1"; shift; fi
@@ -30,9 +33,23 @@ NS="${NS:-code-doc}"; SETTLE="${SETTLE:-30}"; COOLDOWN="${COOLDOWN:-20}"; POLL="
 EXPERIMENT="${EXPERIMENT:-code-doc-assistant-eval}"
 PYTHON="${PYTHON:-python}"; JOIN_MLFLOW="${JOIN_MLFLOW:-1}"
 REMOTE_ROOT="${REMOTE_ROOT:-/app/eval/results}"; RUN_EVAL="${RUN_EVAL:-/app/eval/run_eval.py}"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 OUT="eval/results/$GROUP"; SAMPLES="$OUT/samples-$CONFIG.csv"; REMOTE="$REMOTE_ROOT/$GROUP"
 mkdir -p "$OUT"
+
+# Detach: re-run this script in its own session with its output in a file, and return immediately.
+if [[ "${EVAL_DETACHED:-0}" != "1" && "${FOREGROUND:-0}" != "1" ]]; then
+  DETACH=(nohup); command -v setsid > /dev/null 2>&1 && DETACH=(setsid nohup)
+  rm -f "$OUT/script.exit"
+  EVAL_DETACHED=1 "${DETACH[@]}" "$SELF" "$CONFIG" "$GROUP" -- "$@" > "$OUT/script.log" 2>&1 < /dev/null &
+  echo "started in the background: config=$CONFIG group=$GROUP"
+  echo "  follow:  tail -f $OUT/script.log"
+  echo "  stop:    kill \$(cat $OUT/script.pid)      (the run in the pod keeps going; see script.log)"
+  echo "  done when: $OUT/script.exit exists (holds the exit code)"
+  exit 0
+fi
+if [[ "${EVAL_DETACHED:-0}" == "1" ]]; then echo $$ > "$OUT/script.pid"; fi
 
 POD="${POD:-$(kubectl get pods -n "$NS" -o name | grep -- '-app-' | head -1 | cut -d/ -f2)}"
 [[ -n "$POD" ]] || { echo "no app pod found in namespace $NS"; exit 1; }
@@ -45,7 +62,11 @@ stop_sampler() {
     echo "[$(date +%T)] sampler stopped"
   fi
 }
-cleanup() { stop_sampler; [[ -n "$PF_PID" ]] && kill "$PF_PID" 2>/dev/null; }
+cleanup() {
+  rc=$?
+  stop_sampler; [[ -n "$PF_PID" ]] && kill "$PF_PID" 2>/dev/null
+  if [[ "${EVAL_DETACHED:-0}" == "1" ]]; then echo "$rc" > "$OUT/script.exit"; rm -f "$OUT/script.pid"; fi
+}
 trap cleanup EXIT
 trap 'echo; echo "interrupted - stopping the sampler (the evaluation keeps running in the pod: $REMOTE)"; exit 130' INT TERM
 
@@ -60,7 +81,7 @@ sleep "$SETTLE"
 
 # 2. start the evaluation in the pod, detached
 kubectl exec -n "$NS" "$POD" -- sh -c "mkdir -p '$REMOTE' && rm -f '$REMOTE/.done' '$REMOTE/.exit' && \
-  ( env MLFLOW_EXPERIMENT='$EXPERIMENT' python '$RUN_EVAL' --config '$CONFIG' --group '$GROUP' $EXTRA > '$REMOTE/run.log' 2>&1; \
+  ( env PYTHONUNBUFFERED=1 MLFLOW_EXPERIMENT='$EXPERIMENT' python '$RUN_EVAL' --config '$CONFIG' --group '$GROUP' $EXTRA > '$REMOTE/run.log' 2>&1; \
     echo \$? > '$REMOTE/.exit'; touch '$REMOTE/.done' ) > /dev/null 2>&1 &" \
   || { echo "could not start the evaluation in the pod"; exit 1; }
 echo "[$(date +%T)] evaluation started in the pod (log: $REMOTE/run.log)"
@@ -76,6 +97,9 @@ while true; do
   n=$((n+1))
   if (( n % 4 == 0 )); then
     last="$(kubectl exec -n "$NS" "$POD" -- sh -c "grep -E '^  (WARMUP|Q[0-9])|cold start' '$REMOTE/run.log' | tail -1" 2>/dev/null)"
+    if [[ -z "$last" ]]; then   # nothing printed yet: show the newest log line instead (age shows whether it is moving)
+      last="log: $(kubectl exec -n "$NS" "$POD" -- tail -n 1 "$REMOTE/run.log" 2>/dev/null | cut -c1-110)"
+    fi
     echo "[$(date +%T)] running... ${last:-}"
   fi
   sleep "$POLL"

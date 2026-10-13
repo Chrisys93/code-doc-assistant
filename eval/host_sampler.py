@@ -8,7 +8,8 @@ question so an idle baseline is captured:
     python eval/host_sampler.py --out eval/results/samples.csv --interval 1 --k8s-namespace code-doc
 
 Columns: epoch, gpu_mem_used_mb, gpu_mem_total_mb, gpu_util_pct, gpu_power_w, gpu_temp_c, gpu_sm_clock_mhz,
-host_mem_used_mb, host_mem_avail_mb, host_cpu_pct, k8s_<pod>_cpu_m / k8s_<pod>_mem_mi (when --k8s-namespace is
+host_mem_used_mb, host_mem_avail_mb, host_cpu_pct, host_swap_used_mb, host_pgmajfault / host_pswpin /
+host_pswpout (cumulative counters: take differences between samples), k8s_<pod>_cpu_m / k8s_<pod>_mem_mi (when --k8s-namespace is
 given and metrics-server works: `minikube addons enable metrics-server`).
 
 Join to question time windows with eval/join_resources.py. Stop with Ctrl+C.
@@ -64,6 +65,31 @@ def sample_host() -> dict:
             return {}
 
 
+def sample_pressure() -> dict:
+    """Swap in use and the kernel's paging counters (Linux only; empty elsewhere).
+
+    pgmajfault / pswpin / pswpout are cumulative since boot, so the useful signal is their rate. Major faults (or
+    swap-ins) climbing while the GPU sits idle is the signature of a memory-mapped model being paged in and out of
+    a RAM budget that is too small: the thrash seen in heavy-004, where host_mem_avail_mb stayed at 1.2-1.9 GB."""
+    row = {}
+    try:
+        info = {}
+        for line in open("/proc/meminfo"):
+            k, v = line.split(":")
+            info[k] = float(v.split()[0]) / 1024
+        row["host_swap_used_mb"] = info["SwapTotal"] - info["SwapFree"]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for line in open("/proc/vmstat"):
+            k, v = line.split()
+            if k in ("pgmajfault", "pswpin", "pswpout"):
+                row[f"host_{k}"] = float(v)
+    except Exception:  # noqa: BLE001
+        pass
+    return row
+
+
 def sample_k8s(ns: str) -> dict:
     if not shutil.which("kubectl"):
         return {}
@@ -105,7 +131,7 @@ def main() -> int:
             t = time.time()
             if args.k8s_namespace and n % args.k8s_every == 0:
                 k8s = sample_k8s(args.k8s_namespace)
-            row = {"epoch": round(t, 3), **sample_gpu(), **sample_host(), **k8s}
+            row = {"epoch": round(t, 3), **sample_gpu(), **sample_host(), **sample_pressure(), **k8s}
             for k in row:
                 if k not in fields:
                     fields.append(k)
