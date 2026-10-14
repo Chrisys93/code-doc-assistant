@@ -312,6 +312,7 @@ mlflow:
   # A 512Mi limit makes the current MLflow image OOMKilled, so do not go below ~1Gi.
   resources: {}
   backendStoreUri: "sqlite:////mlflow/mlflow.db"
+  workers: ""     # --workers. Empty = MLflow default (4 processes, ~2.3 GB observed). Set 1 on small hosts (see values-wsl2-minikube.yaml).
   # Artifacts (result.json, eval_checks.json, ...) are uploaded THROUGH the server (serveArtifacts), which stores
   # them under artifactsDestination on its volume. A plain path as defaultArtifactRoot would make every client
   # write to its own local disk instead, and the UI's Artifacts tab would be empty. Only experiments created

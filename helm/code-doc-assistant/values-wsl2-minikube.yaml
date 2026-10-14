@@ -5,6 +5,7 @@ inferenceBackend: llamacpp
 modelTier: heavy
 llamacpp:
   enabled: true
+  gpuLayers: 27          # RTX 5070 Ti 12 GB under WSL2: ~11.8 GB used of 12.2 GB; chart default for the heavy tier is 24 (conservative)
   download:
     enabled: true          # ~10 GB, first start only
   gpu:
@@ -19,3 +20,4 @@ mlflow:
   service:
     type: NodePort
     nodePort: 30500        # MLflow UI
+  workers: 1             # default (4 processes) held 2.3 GB of the 12 GB WSL VM; memory exhaustion broke heavy-009 after Q4

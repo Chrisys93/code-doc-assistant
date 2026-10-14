@@ -33,6 +33,11 @@ spec:
             - --port={{ .Values.mlflow.service.port }}
             - --backend-store-uri={{ .Values.mlflow.backendStoreUri }}
             - --default-artifact-root={{ .Values.mlflow.defaultArtifactRoot }}
+            {{- if .Values.mlflow.workers }}
+            # Each server worker is a separate process; the MLflow default held 2.3 GB on a 12 GB WSL VM that also runs the
+            # model server. One worker should be enough for a single-user evaluation (measure after changing).
+            - --workers={{ .Values.mlflow.workers }}
+            {{- end }}
             {{- if .Values.mlflow.serveArtifacts }}
             # Proxy artifact access through the server. With a plain-path artifact root the CLIENT (the app pod)
             # writes artifacts to its own filesystem and the UI's Artifacts tab stays empty.
